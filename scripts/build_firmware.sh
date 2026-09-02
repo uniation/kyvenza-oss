@@ -65,6 +65,24 @@ if [ ! -x BaseTools/Source/C/bin/GenFw ]; then
         EXTRA_OPTFLAGS="-Wno-macro-redefined -Wno-error"
 fi
 
+# ── 开机标识 ───────────────────────────────────────────────────────
+# edk2 的 LogoDxe 把 `MdeModulePkg/Logo/Logo.bmp` 编进固件,原图是 TianoCore 的
+# 标识。换成我们自己的:客体开机第一眼看到的是 Kyvenza,不是一个用户不认识的
+# 上游项目。规格要求见 scripts/qemu/assets/README.md(24bpp、40 字节 DIB 头、
+# 纯黑底)。
+#
+# 只覆盖不改源:tarball 重新解出来就回到原样,所以每次构建都要盖一次。
+LOGO_SRC="${ROOT}/scripts/qemu/assets/boot-logo.bmp"
+LOGO_DST="${EDK2}/MdeModulePkg/Logo/Logo.bmp"
+if [ -f "$LOGO_SRC" ]; then
+    if ! cmp -s "$LOGO_SRC" "$LOGO_DST"; then
+        echo "==> 换上 Kyvenza 开机标识"
+        cp "$LOGO_SRC" "$LOGO_DST"
+    fi
+else
+    echo "build_firmware: 警告 —— 缺 ${LOGO_SRC},开机画面会是 TianoCore 的标识" >&2
+fi
+
 # brew 的交叉编译器前缀是 aarch64-elf-,不是 QEMU 脚本里假设的 aarch64-linux-gnu-
 export GCC5_AARCH64_PREFIX=aarch64-elf-
 export GCC_AARCH64_PREFIX=aarch64-elf-

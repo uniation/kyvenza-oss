@@ -1,4 +1,4 @@
-060af8f023348ee1a327740d8166a0a3cdaa5edd9cae170639a49321cc5e640c  ./README.md
+e1acd7bd1738db3ea7190738378b2d61bf4c7a5b5621e2970c80dd5696cec1c2  ./README.md
 85d99b79c981a404874c02e0342176cf75c7698e2b51fe41031cf6526d974f1a  ./lgpl/gettext-1.0.tar.gz
 170f5a29d2eb95b9dd1f1f754c0f9b90692c3d5dcf6db02c199c93e2c445177d  ./lgpl/gettext.rb
 ab24d24e698dfa1e408b7bcdb508f4aafc906185a8b8ce72fdf79bbbdc9b383b  ./lgpl/glib-2.88.3.tar.xz
@@ -6,9 +6,13 @@ d846efd0bf62918350da94f850db33b0f8727fece9bfaf8164566e3094e80c97  ./lgpl/glib-ho
 d2ebed597d64ab5518ea78604840e28fb9839fa923bd3917bef5f50b76d369be  ./lgpl/glib.rb
 55c5c141a564245b8f8fbe7698663c87a45a7333c2a2c56f06f811ab73b212dd  ./lgpl/json-glib-1.10.8.tar.xz
 27bbdbc95c695877ef266870c9e51be7c97a319c5c66b217e6fe911315e7b181  ./lgpl/json-glib.rb
-d52de807520abfa5f9fc707b4cc3c4cbfd13da8e101939c16889247d9b9ecb81  ./qemu/patches/README.txt
+3817a6610f8469efc1b9737b1fb188af575aeac79fa9125dced73973e5ee1dab  ./qemu/patches/0001-ui-vnc-do-not-back-off-the-refresh-timer-while-a-job-is-in-flight.patch
+1a7f2b53dbd65f3cb021daaab9ad266928dab30219af771a456e9bfa1a2ccd41  ./qemu/patches/0002-ui-vnc-enlarge-the-client-socket-send-buffer.patch
 6ee1d1a61f68212476b27108c26da5f449dc09b626d42f8279ba0dc2e08fa858  ./qemu/qemu-11.1.0.tar.xz
-87644b76001a0408fa1732283143bad952593e711e4bfe135e3ec9161ec1c21d  ./scripts/build_firmware.sh
-e70d71da965835897819837fbfe25b516337a753ddc146318fc6e70f3ef0e113  ./scripts/build_qemu.sh
+f5023fddff8b4111d7d80a87599910061cd021c91d758f146f5aefc0558f2726  ./scripts/assets/README.md
+448c1e6cfca693e8e0bbcac75c28b3811a6a3ebc65af48d592aed2c848a64a1b  ./scripts/assets/boot-logo.bmp
+e8c365dc9cff25440e88d150d9bf353984f0bb46480bb982e537fb203e043bf6  ./scripts/assets/kyvenza-k.svg
+173519d413a628da0cf6b7b3e9f0daa126f8c84850027a11b41fd61a7130ba40  ./scripts/build_firmware.sh
+9b7c84b902405a1f32f726b74efa6c33ac6eb9190722276ccf07b51fe910ea85  ./scripts/build_qemu.sh
 36ccab7b968e9304519c1ca49308ed6821b922fd4b2e98264753b22053bfbf87  ./scripts/sign_helpers.sh
-652cd63de66294bd2bfebbbb3b6c45cb4ae28955f310f212cd4e04de93a187b4  ./scripts/stage_helpers.sh
+0873a244fef62ce3c6bf8df77ceb0ebf5eb549f427e5eee7e1cc5c45c98de813  ./scripts/stage_helpers.sh

@@ -36,7 +36,8 @@ mkdir -p "$WORK"
 # ── 取源码 ─────────────────────────────────────────────────────────
 if [ ! -d "$SRC" ]; then
     if [ ! -f "$TARBALL" ]; then
-        # 允许从本地已有的 spike 产物复制,省一次跨洋下载
+        # 允许从本地已有的 spike 产物复制,省一次跨洋下载。spike 的 work/ 是
+        # 临时目录、随时可能被清掉,所以这里只是机会主义的复用,缺了就下载。
         LOCAL="${ROOT}/spike/win11arm/work/build/qemu-${QEMU_VERSION}.tar.xz"
         if [ -f "$LOCAL" ]; then
             echo "==> 复用本地 tarball $LOCAL"

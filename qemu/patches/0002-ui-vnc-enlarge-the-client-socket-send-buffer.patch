@@ -1,0 +1,35 @@
+From: Kyvenza <support@kyvenza.com>
+Date: Wed, 2 Sep 2026 15:00:00 +0800
+Subject: [PATCH] ui/vnc: enlarge the client socket send buffer
+
+A FramebufferUpdate for a 2560x1600 desktop is 0.5-1 MiB even with Tight,
+and 3-8 MiB with Raw.  The VNC server writes it from the main loop with the
+platform default send buffer, which is 8 KiB for AF_UNIX sockets on macOS:
+hundreds of writes per update, each waiting for the socket to become
+writable again.  Tracing the guest shows it flushing ~55 times/s while the
+client only sees ~16 updates/s, because refresh ticks that fire while the
+previous update is still draining find the client busy and are skipped.
+
+Ask for a 4 MiB send buffer when a client connects.  The kernel clamps the
+request to its own maximum and a failure only leaves the default in place.
+
+Signed-off-by: Kyvenza <support@kyvenza.com>
+---
+--- a/ui/vnc.c
++++ b/ui/vnc.c
+@@ -3306,6 +3306,15 @@
+                         bool skipauth, bool websocket)
+ {
+     VncConnection *vc = g_new0(VncConnection, 1);
++    /*
++     * A framebuffer update for a large desktop is several MiB.  With the
++     * platform default send buffer (8 KiB for AF_UNIX on macOS) that is
++     * hundreds of writes, each needing another main loop iteration, and
++     * every refresh tick that lands in between finds the client still busy.
++     * Ask for a few MiB; the kernel clamps to its own maximum if needed and
++     * the failure is harmless.
++     */
++    qio_channel_socket_set_send_buffer(sioc, 4 * 1024 * 1024, NULL);
+     VncState *vs = &vc->vs;
+     bool first_client = QTAILQ_EMPTY(&vd->clients);
+ 

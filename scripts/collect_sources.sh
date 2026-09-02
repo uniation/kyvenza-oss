@@ -99,6 +99,15 @@ for s in build_qemu.sh build_firmware.sh stage_helpers.sh sign_helpers.sh; do
     echo "    ${s}"
 done
 
+# 脚本引用的素材也要一起给。`build_firmware.sh` 会把 assets/boot-logo.bmp 盖到
+# edk2 的 Logo.bmp 上,少了它照着脚本编出来的固件和我们发的那份不一致 ——
+# edk2 是 BSD 没有开源义务,但"发出去的字节和公开的配方一致"这条是我们自己立的。
+if [ -d "${DIR}/assets" ]; then
+    mkdir -p "${OUT}/scripts/assets"
+    cp "${DIR}/assets/"* "${OUT}/scripts/assets/"
+    echo "    assets/ ($(ls -1 "${DIR}/assets" | wc -l | tr -d ' ') 个文件)"
+fi
+
 # ── LGPL 组件 ──────────────────────────────────────────────────────
 # 随包的是 Homebrew 构建的 dylib,所以"对应源码"= 上游 tarball + Homebrew formula
 # (里面写着构建参数,glib 还带一个把硬编码路径改成 Homebrew 路径的补丁)。

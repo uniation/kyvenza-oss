@@ -34,7 +34,7 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 QEMU_PREFIX="${QEMU_PREFIX:-${ROOT}/.local/qemu/install}"
 SWTPM_BIN="${SWTPM_BIN:-$(command -v swtpm || true)}"
 FIRMWARE_DIR="${FIRMWARE_DIR:-${ROOT}/.local/qemu/firmware}"
-VIRTIO_WIN_ISO="${VIRTIO_WIN_ISO:-${ROOT}/spike/win11arm/work/virtio-win.iso}"
+VIRTIO_WIN_ISO="${VIRTIO_WIN_ISO:-${ROOT}/.local/qemu/virtio-win.iso}"
 
 HELPERS="${APP}/Contents/Helpers"
 FRAMEWORKS="${APP}/Contents/Frameworks"
@@ -178,6 +178,56 @@ if [ -f "$VIRTIO_WIN_ISO" ]; then
             -exec cp {} "${STAGE_DIR}/" \;
     done
     cp "${MOUNT}/virtio-win_license.txt" "${STAGE_DIR}/LICENSE.txt"
+
+    # ── 可双击的安装器 ──────────────────────────────────────────
+    # virtio-win 上游只提供 x64/x86 的 guest-tools MSI,**ARM64 没有安装器**,
+    # 所以"像 Parallels 那样双击装工具"这条路得我们自己铺。
+    #
+    # 为什么不能只靠设备管理器:装机阶段显示设备是 ramfb,客体里根本没有
+    # virtio-gpu 这块 PCI 设备,「更新驱动」没有目标可选。pnputil 把驱动放进
+    # 驱动仓库,等 Complete Install 之后设备出现时 Windows 自己绑定。
+    #
+    # 换行必须是 CRLF:cmd.exe 解析 LF 换行的批处理会出莫名其妙的语法错误。
+    /usr/bin/python3 - "$STAGE_DIR" <<'PYEOF'
+import io, os, sys
+script = """@echo off
+title Kyvenza Guest Drivers
+
+net session >nul 2>&1
+if not errorlevel 1 goto install
+powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
+exit /b
+
+:install
+echo.
+echo    Kyvenza - Windows guest drivers
+echo    ===============================
+echo.
+echo    Installing display, network and serial drivers...
+echo.
+pnputil /add-driver "%~dp0*.inf" /install
+if errorlevel 1 goto failed
+echo.
+echo    Done.
+echo.
+echo    Next: shut Windows down. In Kyvenza, click "Complete Install",
+echo    then start the VM again. The display switches to the virtio
+echo    adapter on that boot.
+echo.
+pause
+exit /b 0
+
+:failed
+echo.
+echo    Something went wrong. Please report this to support@kyvenza.com.
+echo.
+pause
+exit /b 1
+"""
+out = os.path.join(sys.argv[1], "Install-Kyvenza-Drivers.cmd")
+io.open(out, "wb").write(script.replace("\n", "\r\n").encode("ascii"))
+PYEOF
+
     chmod -R u+w "$STAGE_DIR"
 
     # 打成只读光盘再随包,而不是摊成一堆散文件。两个理由:
