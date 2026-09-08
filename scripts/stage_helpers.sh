@@ -179,6 +179,22 @@ if [ -f "$VIRTIO_WIN_ISO" ]; then
     done
     cp "${MOUNT}/virtio-win_license.txt" "${STAGE_DIR}/LICENSE.txt"
 
+    # ── 剪贴板代理(vdagent)────────────────────────────────────
+    # 与三个驱动一起摊在盘根目录。**全世界没有现成的 ARM64 版本**(上游只发
+    # x86/x64,UTM 的安装器里那一支写着 TODO),所以这两个 exe 是我们自己交叉
+    # 编译的,配方见 scripts/guest-tools/build_vdagent.sh —— GPLv2+,构建脚本
+    # 与补丁随源码交付包一起公开。
+    #
+    # 少了它们,界面上的「共享剪贴板」开关就是个不生效的摆设,而那正是
+    # 2026-09-03 刚清理掉的一类问题。所以这里缺文件要**报错退出**,
+    # 不像 virtio-win 那样只警告 —— 剪贴板开关是随包功能,不能靠人记得补。
+    VDAGENT_BIN="${VDAGENT_BIN_DIR:-${ROOT}/.local/vdagent/out/bin}"
+    for exe in vdagent.exe vdservice.exe; do
+        [ -f "${VDAGENT_BIN}/${exe}" ] || die \
+            "缺 ${VDAGENT_BIN}/${exe},先跑 make guest-tools(或设 VDAGENT_BIN_DIR)"
+        cp "${VDAGENT_BIN}/${exe}" "${STAGE_DIR}/"
+    done
+
     # ── 可双击的安装器 ──────────────────────────────────────────
     # virtio-win 上游只提供 x64/x86 的 guest-tools MSI,**ARM64 没有安装器**,
     # 所以"像 Parallels 那样双击装工具"这条路得我们自己铺。
@@ -188,10 +204,19 @@ if [ -f "$VIRTIO_WIN_ISO" ]; then
     # 驱动仓库,等 Complete Install 之后设备出现时 Windows 自己绑定。
     #
     # 换行必须是 CRLF:cmd.exe 解析 LF 换行的批处理会出莫名其妙的语法错误。
+    # **批处理正文只能是 ASCII**(下面 encode("ascii") 会把关);中文缘由一律写在
+    # 这里,不要写进 rem 行 —— 客体的 OEM 代码页也显示不出来。
+    #
+    # 关于 pnputil 的退出码:259 = 没有新驱动可加(驱动早装过、或重复运行安装器),
+    # 3010 = 装好了但要重启,两者都是成功。2.1.0 之前写成 `if errorlevel 1 goto
+    # failed`,于是所有从旧版本升级上来的用户(驱动早已就位)一跑安装器就跳到
+    # failed,**剪贴板代理从来没被装上**,而且界面上没有任何迹象。真机上复现过。
+    # 剪贴板代理与驱动是两件独立的事,现在无论驱动那步结果如何都会装。
     /usr/bin/python3 - "$STAGE_DIR" <<'PYEOF'
 import io, os, sys
-script = """@echo off
-title Kyvenza Guest Drivers
+# 原始字符串:脚本里有 Windows 路径的反斜杠,普通字符串里 \K 之类是非法转义。
+script = r"""@echo off
+title Kyvenza Guest Tools
 
 net session >nul 2>&1
 if not errorlevel 1 goto install
@@ -200,19 +225,116 @@ exit /b
 
 :install
 echo.
-echo    Kyvenza - Windows guest drivers
-echo    ===============================
+echo    Kyvenza - Windows guest tools
+echo    ============================
 echo.
 echo    Installing display, network and serial drivers...
 echo.
 pnputil /add-driver "%~dp0*.inf" /install
-if errorlevel 1 goto failed
+set PNPRESULT=%errorlevel%
+set DRIVERS=ok
+rem pnputil returns non-zero on success too: 259 means there was nothing new to
+rem add (the normal case when the drivers are already installed), 3010 means it
+rem installed them but wants a reboot. Treating those as failures skips
+rem everything below.
+if %PNPRESULT% equ 0 goto clipboard
+if %PNPRESULT% equ 259 goto clipboard
+if %PNPRESULT% equ 3010 goto clipboard
+set DRIVERS=failed
+echo    Driver installation reported code %PNPRESULT%.
+
+:clipboard
 echo.
+echo    Installing the clipboard agent...
+echo.
+rem The clipboard agent is independent of the drivers, so it installs either way.
+rem The service records an absolute path to its executable, so the agent has to
+rem live on the system drive. Registering it straight off this disc would break
+rem the moment the disc is ejected or swapped.
+set "KYVDIR=%ProgramFiles%\Kyvenza"
+if not exist "%KYVDIR%" mkdir "%KYVDIR%"
+rem Stop the old copy BEFORE overwriting it. On an upgrade the running agent
+rem holds its own executable open, so copying first fails with "another program
+rem is using this file" while the installer still reports success - the service
+rem re-registers happily, pointing at the OLD binary. The machine then keeps the
+rem previous agent forever and nothing on screen says so. Seen on a real guest.
+sc stop vdservice >nul 2>&1
+sc delete vdservice >nul 2>&1
+rem sc returns as soon as the stop is pending, and vdagent.exe runs in the user
+rem session rather than as the service itself, so neither file is free yet.
+timeout /t 3 /nobreak >nul
+taskkill /f /im vdagent.exe >nul 2>&1
+copy /Y "%~dp0vdagent.exe" "%KYVDIR%\" >nul
+if errorlevel 1 goto agentbusy
+copy /Y "%~dp0vdservice.exe" "%KYVDIR%\" >nul
+if errorlevel 1 goto agentbusy
+"%KYVDIR%\vdservice.exe" install
+sc start vdservice >nul 2>&1
+rem sc start returns as soon as the service is START_PENDING, so give it a
+rem moment before asking whether it is actually running.
+timeout /t 3 /nobreak >nul
+sc query vdservice | find "RUNNING" >nul
+if errorlevel 1 (
+    echo    The clipboard agent did not start. Everything else is installed;
+    echo    shared clipboard stays off until it does.
+) else (
+    echo    Clipboard agent running.
+)
+goto shares
+
+:agentbusy
+echo    Could not replace the clipboard agent: it is still in use.
+echo    Restart Windows and run this installer again.
+
+:shares
+echo.
+echo    Setting up shared folders...
+echo.
+rem Shared folders ride on Windows' own WebDAV client (the WebClient service).
+rem Nothing is installed here: this only turns that service on and raises two of
+rem its limits. It is independent of the drivers and of the clipboard agent, so
+rem it runs whatever happened above.
+sc config WebClient start= auto >nul 2>&1
+rem WebClient refuses files larger than 50 MB by default, which is far too small
+rem for the thing people actually use a shared folder for. 0xFFFFFFFF is the
+rem maximum the service accepts.
+reg add "HKLM\SYSTEM\CurrentControlSet\Services\WebClient\Parameters" /v FileSizeLimitInBytes /t REG_DWORD /d 4294967295 /f >nul 2>&1
+rem The other default cap is on how much directory metadata one listing may
+rem return; a folder with a few thousand files hits it and simply fails to open.
+reg add "HKLM\SYSTEM\CurrentControlSet\Services\WebClient\Parameters" /v FileAttributesLimitInBytes /t REG_DWORD /d 8000000 /f >nul 2>&1
+rem Both limits are read when the service starts, so restart it here rather than
+rem leaving the user with settings that only take effect after the next reboot.
+sc stop WebClient >nul 2>&1
+sc start WebClient >nul 2>&1
+
+copy /Y "%~dp0Find-Kyvenza-Shares.cmd" "%KYVDIR%\" >nul
+rem Map the drive at every logon. The task must run with a LIMITED token: drive
+rem letters mapped by an elevated process belong to the elevated session and are
+rem invisible to Explorer, so an administrator task would look like it worked
+rem while no drive ever appeared.
+schtasks /create /tn "Kyvenza Shared Folders" /sc onlogon /rl limited /f /tr "\"%KYVDIR%\Find-Kyvenza-Shares.cmd\"" >nul 2>&1
+if errorlevel 1 (
+    echo    Could not register the logon task. You can still connect the shares
+    echo    by double-clicking Connect-Kyvenza-Shares on the KYVENZA disc.
+) else (
+    echo    Shared folders will connect at every sign-in.
+)
+
+echo.
+if "%DRIVERS%"=="failed" goto failed
 echo    Done.
 echo.
 echo    Next: shut Windows down. In Kyvenza, click "Complete Install",
 echo    then start the VM again. The display switches to the virtio
 echo    adapter on that boot.
+echo.
+rem Reinstalling restarts the agent service, which drops the channel the host
+rem opened when the display window appeared - and the host does not reconnect on
+rem its own. The clipboard then does nothing at all, text included, with nothing
+rem on screen to explain why. Every upgrading user runs this installer, so say it
+rem here rather than leaving them to find it.
+echo    If Kyvenza's display window was open while this ran, close it and
+echo    open it again. The clipboard reconnects with the window.
 echo.
 pause
 exit /b 0
@@ -224,8 +346,26 @@ echo.
 pause
 exit /b 1
 """
-out = os.path.join(sys.argv[1], "Install-Kyvenza-Drivers.cmd")
-io.open(out, "wb").write(script.replace("\n", "\r\n").encode("ascii"))
+# 登录时跑的小脚本。**它不能内嵌 URL** —— 端口与 token 是每台 VM 一份、
+# 且可能在启动时变,而这张光盘是随包的、所有 VM 共用。所以它只负责去各个盘符里
+# 找那张 KYVENZA 脚本盘,真正的地址在那上面。
+finder = r"""@echo off
+rem Find the Kyvenza shares disc and run the connect script on it. The disc is a
+rem small read-only volume the app attaches at every boot; it carries this VM's
+rem own address, which this file deliberately does not.
+for %%d in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do (
+    if exist %%d:\Connect-Kyvenza-Shares.cmd (
+        call %%d:\Connect-Kyvenza-Shares.cmd
+        exit /b 0
+    )
+)
+exit /b 1
+"""
+
+for name, text in (("Install-Kyvenza-Drivers.cmd", script),
+                   ("Find-Kyvenza-Shares.cmd", finder)):
+    out = os.path.join(sys.argv[1], name)
+    io.open(out, "wb").write(text.replace("\n", "\r\n").encode("ascii"))
 PYEOF
 
     chmod -R u+w "$STAGE_DIR"

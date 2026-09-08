@@ -11,7 +11,8 @@
 # 上传用 `make publish-oss-source`。
 #
 # **哪些是义务、哪些是好意,分清楚**:
-#   义务  QEMU(GPLv2)、glib 系(LGPL-2.1+:glib/gobject/gio/gmodule)、
+#   义务  QEMU(GPLv2)、SPICE vd_agent(GPLv2+,随驱动光盘进客体)、
+#         glib 系(LGPL-2.1+:glib/gobject/gio/gmodule)、
 #         json-glib(LGPL-2.1+)、gettext 的 libintl(LGPL-2.1+)
 #   好意  pixman(MIT)、libslirp / PCRE2 / libtpms / swtpm(BSD)、OpenSSL(Apache-2.0)、
 #         edk2(BSD-2-Clause-Patent)、virtio-win 驱动(BSD-3)
@@ -24,6 +25,12 @@ OUT="${ROOT}/dist/oss-sources"
 
 QEMU_VERSION="${QEMU_VERSION:-11.1.0}"
 QEMU_SHA256="6ee1d1a61f68212476b27108c26da5f449dc09b626d42f8279ba0dc2e08fa858"
+
+# SPICE vd_agent(GPLv2+)。跑在**客体里**,随驱动光盘分发。
+# 版本与 sha256 必须与 scripts/guest-tools/build_vdagent.sh 里的一致 ——
+# 那份脚本是构建方式,这里是对应源码,两者对不上就等于没履行义务。
+VDAGENT_VERSION="0.10.0"
+VDAGENT_SHA256="918be9638164212d1787f9a9107584c5445adc638e592ae9260ec0797b25020d"
 
 # LGPL 组件。版本必须与随包 dylib 实际构建自的版本一致 —— 我们用的是 Homebrew 的
 # 二进制,所以这里的版本、URL、sha256 全部取自对应 formula 的 stable 段
@@ -47,7 +54,31 @@ fetch() {
         rm -f "$dest"
     fi
     echo "    下载 $(basename "$dest")"
-    curl -fsSL --retry 3 -o "$dest" "$url"
+    # **ftpmirror.gnu.org 排到后面。** 它是随机轮询,轮到挂掉的镜像就完蛋:
+    # 2026-09-06 发布时先返回 502/504,后来变成"连上了但一个字节都不传"。
+    # 而这一步是 GPLv2 §3 的义务,取不到源码就不能发版,所以先走 ftp.gnu.org
+    # 这个固定站点,ftpmirror 留作回退。
+    #
+    # 换源是安全的:sha256 在下面钉死,取到的字节不一致一样会被拒。
+    local urls="$url"
+    case "$url" in
+        https://ftpmirror.gnu.org/*)
+            urls="${url/ftpmirror.gnu.org/ftp.gnu.org} $url"
+            ;;
+    esac
+    local ok=0 u
+    for u in $urls; do
+        # 两道闸都必要:--retry-max-time 挡住"持续 502 时带退避重试很久",
+        # --speed-limit/--speed-time 挡住"连上了却一个字节都不传"。只有前者时
+        # 后一种情况仍会无限期挂住 —— 实测踩过。
+        if curl -fsSL --retry 2 --retry-max-time 30 --connect-timeout 15 \
+                --speed-limit 2048 --speed-time 20 -o "$dest" "$u"; then
+            ok=1
+            break
+        fi
+        echo "    取不到 $u,换下一个源" >&2
+    done
+    [ "$ok" = 1 ] || die "$(basename "$dest") 所有源都取不到"
     local have; have="$(shasum -a 256 "$dest" | awk '{print $1}')"
     [ "$have" = "$want" ] || die "$(basename "$dest") sha256 不匹配
   期望 $want
@@ -55,7 +86,7 @@ fetch() {
 }
 
 rm -rf "$OUT"
-mkdir -p "${OUT}/qemu" "${OUT}/scripts" "${OUT}/lgpl"
+mkdir -p "${OUT}/qemu" "${OUT}/scripts" "${OUT}/lgpl" "${OUT}/vdagent"
 
 # ── QEMU:我们分发的那份二进制的完整对应源码 ──────────────────────
 echo "==> QEMU ${QEMU_VERSION}"
@@ -92,12 +123,38 @@ automatically.
 EOF
 fi
 
+# ── SPICE vd_agent:客体里那个剪贴板代理 ──────────────────────────
+# 上游只发 x86/x64,ARM64 这一份是我们自己交叉编译的,所以除了源码之外
+# **必须**给出我们施加的补丁与构建脚本,否则拿到源码也复现不出这两个 exe。
+echo "==> SPICE vd_agent ${VDAGENT_VERSION}"
+VDAGENT_TARBALL="${ROOT}/.local/vdagent/src/vdagent-win-${VDAGENT_VERSION}.tar.xz"
+if [ -f "$VDAGENT_TARBALL" ]; then
+    have="$(shasum -a 256 "$VDAGENT_TARBALL" | awk '{print $1}')"
+    [ "$have" = "$VDAGENT_SHA256" ] || die "本地 vd_agent tarball 哈希不符,拒绝打包"
+    cp "$VDAGENT_TARBALL" "${OUT}/vdagent/"
+    echo "    复用本地 tarball"
+else
+    fetch "https://www.spice-space.org/download/windows/vdagent/vdagent-win-${VDAGENT_VERSION}/vdagent-win-${VDAGENT_VERSION}.tar.xz" \
+        "${OUT}/vdagent/vdagent-win-${VDAGENT_VERSION}.tar.xz" "$VDAGENT_SHA256"
+fi
+
+VDAGENT_DIR="${ROOT}/scripts/guest-tools"
+mkdir -p "${OUT}/vdagent/patches"
+shopt -s nullglob
+VDAGENT_PATCHES=("${VDAGENT_DIR}"/patches/*.patch)
+shopt -u nullglob
+[ ${#VDAGENT_PATCHES[@]} -gt 0 ] || die "scripts/guest-tools/patches 是空的 —— 那些补丁是编出 ARM64 版本的必要条件"
+cp "${VDAGENT_PATCHES[@]}" "${OUT}/vdagent/patches/"
+echo "    补丁 ${#VDAGENT_PATCHES[@]} 个"
+
 # ── 构建方式(GPLv2 §3 明文要求)────────────────────────────────
 echo "==> 构建脚本"
 for s in build_qemu.sh build_firmware.sh stage_helpers.sh sign_helpers.sh; do
     cp "${DIR}/${s}" "${OUT}/scripts/"
     echo "    ${s}"
 done
+cp "${VDAGENT_DIR}/build_vdagent.sh" "${OUT}/scripts/"
+echo "    build_vdagent.sh"
 
 # 脚本引用的素材也要一起给。`build_firmware.sh` 会把 assets/boot-logo.bmp 盖到
 # edk2 的 Logo.bmp 上,少了它照着脚本编出来的固件和我们发的那份不一致 ——
