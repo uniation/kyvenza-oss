@@ -10,14 +10,19 @@ writable again.  Tracing the guest shows it flushing ~55 times/s while the
 client only sees ~16 updates/s, because refresh ticks that fire while the
 previous update is still draining find the client busy and are skipped.
 
-Ask for a 4 MiB send buffer when a client connects.  The kernel clamps the
-request to its own maximum and a failure only leaves the default in place.
+Ask for the largest send buffer the kernel will grant when a client
+connects, trying 32 MiB and halving down to 1 MiB.  A Raw update for a
+2560x1600 desktop is 16 MiB; the fewer writes it takes, the fewer main loop
+iterations it waits for.  On macOS kern.ipc.maxsockbuf is 8 MiB by default
+and setsockopt() fails outright above it rather than clamping, so a single
+fixed request either wastes headroom or silently leaves the 8 KiB default
+in place.  A failure on the last rung is harmless.
 
 Signed-off-by: Kyvenza <support@kyvenza.com>
 ---
 --- a/ui/vnc.c
 +++ b/ui/vnc.c
-@@ -3306,6 +3306,15 @@
+@@ -3306,6 +3306,21 @@
                          bool skipauth, bool websocket)
  {
      VncConnection *vc = g_new0(VncConnection, 1);
@@ -26,10 +31,16 @@ Signed-off-by: Kyvenza <support@kyvenza.com>
 +     * platform default send buffer (8 KiB for AF_UNIX on macOS) that is
 +     * hundreds of writes, each needing another main loop iteration, and
 +     * every refresh tick that lands in between finds the client still busy.
-+     * Ask for a few MiB; the kernel clamps to its own maximum if needed and
-+     * the failure is harmless.
++     * Ask for as much as the kernel will grant, from 32 MiB down.  macOS
++     * rejects (rather than clamps) anything above kern.ipc.maxsockbuf, 8 MiB
++     * by default, so a single fixed request would either waste the headroom
++     * or silently keep the 8 KiB default.  Failing every rung is harmless.
 +     */
-+    qio_channel_socket_set_send_buffer(sioc, 4 * 1024 * 1024, NULL);
++    for (size_t sndbuf = 32 * 1024 * 1024; sndbuf >= 1024 * 1024; sndbuf /= 2) {
++        if (qio_channel_socket_set_send_buffer(sioc, sndbuf, NULL) == 0) {
++            break;
++        }
++    }
      VncState *vs = &vc->vs;
      bool first_client = QTAILQ_EMPTY(&vd->clients);
  

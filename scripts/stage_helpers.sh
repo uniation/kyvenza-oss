@@ -320,6 +320,28 @@ if errorlevel 1 (
     echo    Shared folders will connect at every sign-in.
 )
 
+:performance
+echo.
+echo    Turning off desktop effects that are slow without a GPU...
+echo.
+rem The display driver has no 3D acceleration, so every DWM effect - window
+rem animations, transparency, dragging a window with its contents showing - is
+rem rendered on the CPU and pushed through the display channel as a large dirty
+rem region. These four values are the ones "Adjust for best performance" sets:
+rem all under HKCU, all reversible from Settings > Accessibility > Visual effects
+rem and System > Advanced system settings > Performance. The UAC prompt keeps the
+rem signed-in user's hive when that user is an administrator, which is the normal
+rem setup on a fresh Windows install.
+reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" /v VisualFXSetting /t REG_DWORD /d 2 /f >nul 2>&1
+reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" /v EnableTransparency /t REG_DWORD /d 0 /f >nul 2>&1
+reg add "HKCU\Control Panel\Desktop\WindowMetrics" /v MinAnimate /t REG_SZ /d 0 /f >nul 2>&1
+reg add "HKCU\Control Panel\Desktop" /v DragFullWindows /t REG_SZ /d 0 /f >nul 2>&1
+rem Explorer and DWM read these at sign-in; poke them now so the change is
+rem visible without signing out. The call is best-effort.
+rundll32.exe user32.dll,UpdatePerUserSystemParameters 1, True >nul 2>&1
+echo    Desktop effects set to best performance. Undo it any time in
+echo    Settings ^> Accessibility ^> Visual effects.
+
 echo.
 if "%DRIVERS%"=="failed" goto failed
 echo    Done.
