@@ -320,6 +320,69 @@ if errorlevel 1 (
     echo    Shared folders will connect at every sign-in.
 )
 
+:ssh
+echo.
+echo    Enabling remote command access...
+echo.
+rem This is what lets Kyvenza (and an AI assistant driving it) run commands
+rem inside this VM. It turns on Windows' own OpenSSH Server and nothing else:
+rem no third-party binary is installed, and the server only ever listens on the
+rem VM's own network, which Kyvenza forwards to 127.0.0.1 on the Mac.
+rem
+rem OpenSSH Server is a Feature on Demand, so this step needs the VM to have
+rem internet access the first time. Failing here is not fatal: everything above
+rem already worked, and the user can re-run this installer once online.
+sc query sshd >nul 2>&1
+if not errorlevel 1 goto sshconfig
+dism /online /Add-Capability /CapabilityName:OpenSSH.Server~~~~0.0.1.0 /quiet /norestart >nul 2>&1
+sc query sshd >nul 2>&1
+if errorlevel 1 (
+    echo    Could not install OpenSSH Server. This step needs internet access
+    echo    in the VM. Connect it to the network and run this installer again.
+    echo    Everything else above is already set up.
+    goto performance
+)
+
+:sshconfig
+sc config sshd start= auto >nul 2>&1
+net start sshd >nul 2>&1
+rem Without this rule sshd listens on 0.0.0.0:22 and the Mac still cannot reach
+rem it. The rule OpenSSH's own installer creates is scoped to network profiles
+rem that this VM's NAT adapter does not match, and a blocked connection looks
+rem exactly like a VM that never finished booting. Verified on Windows 11 25H2:
+rem sshd RUNNING, port LISTENING, host got no banner until this rule existed.
+rem
+rem remoteip pins it to 10.0.2.2, the NAT gateway, which is this Mac and nothing
+rem else. Opening port 22 to every profile would also expose sshd to the real
+rem network the moment the user switches the VM to bridged networking.
+netsh advfirewall firewall delete rule name="Kyvenza SSH (host only)" >nul 2>&1
+netsh advfirewall firewall add rule name="Kyvenza SSH (host only)" dir=in action=allow protocol=TCP localport=22 remoteip=10.0.2.2 >nul 2>&1
+rem The per-VM public key is NOT on this disc: this disc ships with Kyvenza and
+rem is the same for every VM, while each VM has its own key. The key arrives on
+rem the small KYVENZA script disc instead, which Kyvenza rewrites at every boot.
+copy /Y "%~dp0Find-Kyvenza-SSH.cmd" "%KYVDIR%\" >nul 2>&1
+call "%KYVDIR%\Find-Kyvenza-SSH.cmd" /quiet >nul 2>&1
+rem Report the outcome rather than assuming it. A wrong ACL on the key file makes
+rem sshd ignore it *silently* - the only trace is in the Event Viewer - so the
+rem failure has to be visible here, while the user is still looking.
+sc query sshd | find "RUNNING" >nul 2>&1
+if errorlevel 1 (
+    echo    OpenSSH Server is installed but not running. Check the Event Viewer.
+) else (
+    if not exist "%ProgramData%\ssh\administrators_authorized_keys" (
+        echo    OpenSSH Server is running, but this VM's key was not found.
+        echo    Open the KYVENZA disc and run Configure-Kyvenza-SSH as administrator.
+    ) else (
+        netsh advfirewall firewall show rule name="Kyvenza SSH (host only)" >nul 2>&1
+        if errorlevel 1 (
+            echo    OpenSSH Server is running, but the firewall rule is missing,
+            echo    so the Mac cannot reach it. Run this installer again.
+        ) else (
+            echo    Remote command access is ready.
+        )
+    )
+)
+
 :performance
 echo.
 echo    Turning off desktop effects that are slow without a GPU...
@@ -384,8 +447,23 @@ for %%d in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do (
 exit /b 1
 """
 
+# SSH 侧同构:这张光盘上只有「去找那张盘」的逻辑,每台 VM 独有的公钥在那张盘上。
+ssh_finder = r"""@echo off
+rem Find the Kyvenza script disc and run the SSH setup on it. That disc carries
+rem this VM's own public key, which this file deliberately does not: this disc
+rem ships with the app and is identical for every VM.
+for %%d in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do (
+    if exist %%d:\Configure-Kyvenza-SSH.cmd (
+        call %%d:\Configure-Kyvenza-SSH.cmd %*
+        exit /b 0
+    )
+)
+exit /b 1
+"""
+
 for name, text in (("Install-Kyvenza-Drivers.cmd", script),
-                   ("Find-Kyvenza-Shares.cmd", finder)):
+                   ("Find-Kyvenza-Shares.cmd", finder),
+                   ("Find-Kyvenza-SSH.cmd", ssh_finder)):
     out = os.path.join(sys.argv[1], name)
     io.open(out, "wb").write(text.replace("\n", "\r\n").encode("ascii"))
 PYEOF
