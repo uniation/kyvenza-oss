@@ -36,6 +36,10 @@ VDAGENT_SHA256="918be9638164212d1787f9a9107584c5445adc638e592ae9260ec0797b25020d
 # 二进制,所以这里的版本、URL、sha256 全部取自对应 formula 的 stable 段
 # (`brew info --json=v2 <formula>`)。**升级 Homebrew 依赖后必须回来更新这三行**,
 # 否则交付的源码对不上实际分发的二进制,义务没有履行。
+#
+# 以前「必须回来更新」只靠人记得:2026-09-20 Homebrew 把 glib 升到 2.90.0,
+# 9-23 打的 MAS 3.0.2 就带着 2.90.0 出去了,而这里还写着 2.88.3。现在下面会逐个
+# 比对 Homebrew 实际装的版本,不一致直接失败。
 LGPL_SPECS="
 glib|2.90.0|https://download.gnome.org/sources/glib/2.90/glib-2.90.0.tar.xz|17d15cac2af80a33271127408e0abc2748eb297c595c2a26409e81e14e7d1b8f
 json-glib|1.10.8|https://download.gnome.org/sources/json-glib/1.10/json-glib-1.10.8.tar.xz|55c5c141a564245b8f8fbe7698663c87a45a7333c2a2c56f06f811ab73b212dd
@@ -173,25 +177,31 @@ echo "==> LGPL 组件"
 echo "$LGPL_SPECS" | while IFS='|' read -r name version url sha; do
     [ -n "$name" ] || continue
     echo "  ${name} ${version}"
+    # 随包的 dylib 就是 Homebrew 此刻装着的那份(stage_helpers.sh 从这里拷)。
+    # keg 目录名形如 2.90.0 或 2.90.0_1,下划线后是 formula 修订号,上游源码相同。
+    KEG="$(realpath "/opt/homebrew/opt/${name}" 2>/dev/null)" || die "Homebrew 里没装 ${name}"
+    INSTALLED="$(basename "$KEG")"
+    INSTALLED="${INSTALLED%%_*}"
+    [ "$INSTALLED" = "$version" ] || die "${name}: Homebrew 装的是 ${INSTALLED},这里写的是 ${version}。
+  随包 dylib 来自 Homebrew,交付的源码必须与之对应。按下面的输出更新 LGPL_SPECS 那一行:
+  brew info --json=v2 ${name} | python3 -c \"import json,sys;u=json.load(sys.stdin)['formulae'][0]['urls']['stable'];print(u['url'],u['checksum'])\""
     fetch "$url" "${OUT}/lgpl/$(basename "$url")" "$sha"
-    FORMULA="/opt/homebrew/opt/${name}/.brew/${name}.rb"
-    if [ -f "$FORMULA" ]; then
-        cp "$FORMULA" "${OUT}/lgpl/${name}.rb"
-        echo "    formula ${name}.rb"
-    else
-        echo "    ⚠ 找不到 ${FORMULA},交付包缺少该组件的实际构建方式" >&2
-    fi
+    FORMULA="${KEG}/.brew/${name}.rb"
+    [ -f "$FORMULA" ] || die "找不到 ${FORMULA}:formula 是这份二进制的实际构建方式,缺了就不是完整对应源码"
+    cp "$FORMULA" "${OUT}/lgpl/${name}.rb"
+    echo "    formula ${name}.rb"
 done
 
 # glib 的 formula 引用了 homebrew-core 里的一个补丁文件,本地 API 安装模式下
 # 不存在,从上游仓库取。少了它,交付的就不是我们这份 dylib 的完整对应源码。
+#
+# 取的是 HEAD,所以**哈希钉死**:API 安装模式不记录 tap 的 commit,没法按构建时的
+# 版本去取;上游一旦改了这个补丁,这里就失败,由人确认随包那份 glib 用的是哪一版
+# 再更新哈希。2025-10-15 之后它没变过,3.0.1 交付的也是这一份。
 GLIB_PATCH_URL="https://raw.githubusercontent.com/Homebrew/homebrew-core/HEAD/Patches/glib/hardcoded-paths.diff"
+GLIB_PATCH_SHA256="d846efd0bf62918350da94f850db33b0f8727fece9bfaf8164566e3094e80c97"
 echo "  glib Homebrew 补丁"
-if curl -fsL --retry 3 -o "${OUT}/lgpl/glib-homebrew-hardcoded-paths.diff" "$GLIB_PATCH_URL"; then
-    echo "    hardcoded-paths.diff"
-else
-    echo "    ⚠ 取不到 ${GLIB_PATCH_URL},请手工补上" >&2
-fi
+fetch "$GLIB_PATCH_URL" "${OUT}/lgpl/glib-homebrew-hardcoded-paths.diff" "$GLIB_PATCH_SHA256"
 
 cp "${ROOT}/docs/oss-sources-README.md" "${OUT}/README.md"
 

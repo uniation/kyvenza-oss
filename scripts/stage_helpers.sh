@@ -53,6 +53,28 @@ die() { echo "stage_helpers: $*" >&2; exit 1; }
 [ -f "${FIRMWARE_DIR}/secboot-vars.fd" ] || \
     die "缺 NVRAM 模板 ${FIRMWARE_DIR}/secboot-vars.fd,先跑 scripts/qemu/build_firmware.sh"
 
+# 下面两项以前缺了只打一句警告就往下走,`make release-full` 照样出包:
+#   - 缺 virtio-win ISO:整张驱动盘不进包(客体没有网卡与显示驱动,vdagent、
+#     Install-Kyvenza-Drivers、共享与 SSH 配置全没了),连「缺 vdagent 就退出」
+#     那道检查也写在同一个 if 里一并被跳过。
+#   - 随包 QEMU 不是由当前脚本与补丁建出来的:发版不重跑 make qemu,改了补丁却
+#     忘了重建,交付的源码与二进制就对不上(GPLv2 §3)。
+# 只有调试手测包(`KYVENZA_DEV_STAGE=1`,见 Makefile 的 manual-test-app)降级成警告。
+require() {
+    if [ "${KYVENZA_DEV_STAGE:-0}" = "1" ]; then
+        echo "stage_helpers: 警告(调试包放行,正式组包会失败): $*" >&2
+    else
+        die "$*"
+    fi
+}
+[ -f "$VIRTIO_WIN_ISO" ] || \
+    require "缺 ${VIRTIO_WIN_ISO}。客体将没有网卡、显示驱动与客体工具"
+# 只在用默认位置的 QEMU 时比对:显式指了 QEMU_PREFIX 的,指纹记录不在那里。
+if [ "$QEMU_PREFIX" = "${ROOT}/.local/qemu/install" ]; then
+    bash "${ROOT}/scripts/qemu/build_qemu.sh" --check >/dev/null 2>&1 || \
+        require "随包 QEMU 与当前 build_qemu.sh / patches 不对应(或从未记录指纹),先跑 make qemu"
+fi
+
 rm -rf "$HELPERS" "$DATA"
 mkdir -p "$HELPERS" "$FRAMEWORKS" "$DATA"
 
@@ -482,8 +504,31 @@ PYEOF
     cp "${MOUNT}/virtio-win_license.txt" "${DATA}/drivers-LICENSE.txt"
     rm -rf "$STAGE_DIR"
 else
-    echo "stage_helpers: 警告 —— 缺 ${VIRTIO_WIN_ISO},不打包 virtio 驱动" >&2
-    echo "               客体将没有网卡和显示驱动。发布前必须补上。" >&2
+    # 走到这里只可能是调试包:正式组包在文件开头的 require 那里就已经失败了。
+    echo "stage_helpers: 调试包未打包 virtio 驱动(缺 ${VIRTIO_WIN_ISO})" >&2
+fi
+
+# ── Windows 的系统版本门槛 ─────────────────────────────────────────
+# App 支持到 macOS 14,但随包 QEMU 与 Homebrew 动态库是按更新的系统建的,老系统上
+# dyld 直接拒绝加载。App 靠 Info.plist 的 KyvenzaWindowsMinimumSystemVersion 在
+# 运行时挡住 Windows(WindowsGuestAvailability),所以这个声明必须不低于随包二进制
+# 实际要求的最高版本。Homebrew 升级、换 SDK 都可能让门槛悄悄变高 —— 那时要打包失败,
+# 而不是发出一个在部分系统上建得出、起不来的版本。
+PLIST="${APP}/Contents/Info.plist"
+DECLARED="$(plutil -extract KyvenzaWindowsMinimumSystemVersion raw -o - "$PLIST" 2>/dev/null || true)"
+[ -n "$DECLARED" ] || require "Info.plist 缺 KyvenzaWindowsMinimumSystemVersion(${PLIST})"
+REQUIRED="$(for f in "${HELPERS}"/* "${FRAMEWORKS}"/*.dylib; do
+        otool -l "$f" 2>/dev/null | awk '/LC_BUILD_VERSION/{x=1} x && $1=="minos"{print $2; exit}'
+    done | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)"
+[ -n "$REQUIRED" ] || die "读不出随包二进制的最低系统版本"
+if [ -n "$DECLARED" ]; then
+    HIGHER="$(printf '%s\n%s\n' "$DECLARED" "$REQUIRED" | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)"
+    if [ "$HIGHER" != "$DECLARED" ] && [ "$REQUIRED" != "$DECLARED" ]; then
+        require "随包二进制要求 macOS ${REQUIRED},但 Info.plist 声明 Windows 只要 ${DECLARED}。
+  老系统上用户能建 Windows 却起不来。把 KyvenzaWindowsMinimumSystemVersion 调到 ${REQUIRED},
+  并同步官网与 App Store 上的系统要求说明。"
+    fi
+    echo "stage_helpers: Windows 门槛 macOS ${DECLARED},随包二进制最高要求 ${REQUIRED}"
 fi
 
 echo "stage_helpers: 完成"
