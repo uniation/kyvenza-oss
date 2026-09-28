@@ -37,7 +37,7 @@ VDAGENT_SHA256="918be9638164212d1787f9a9107584c5445adc638e592ae9260ec0797b25020d
 # (`brew info --json=v2 <formula>`)。**升级 Homebrew 依赖后必须回来更新这三行**,
 # 否则交付的源码对不上实际分发的二进制,义务没有履行。
 LGPL_SPECS="
-glib|2.88.3|https://download.gnome.org/sources/glib/2.88/glib-2.88.3.tar.xz|ab24d24e698dfa1e408b7bcdb508f4aafc906185a8b8ce72fdf79bbbdc9b383b
+glib|2.90.0|https://download.gnome.org/sources/glib/2.90/glib-2.90.0.tar.xz|17d15cac2af80a33271127408e0abc2748eb297c595c2a26409e81e14e7d1b8f
 json-glib|1.10.8|https://download.gnome.org/sources/json-glib/1.10/json-glib-1.10.8.tar.xz|55c5c141a564245b8f8fbe7698663c87a45a7333c2a2c56f06f811ab73b212dd
 gettext|1.0|https://ftpmirror.gnu.org/gnu/gettext/gettext-1.0.tar.gz|85d99b79c981a404874c02e0342176cf75c7698e2b51fe41031cf6526d974f1a
 "
