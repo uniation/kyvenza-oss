@@ -1,0 +1,33 @@
+--- a/vdagent/display_configuration.cpp	2019-12-10 21:20:25
++++ b/vdagent/display_configuration.cpp	2026-09-05 10:51:12
+@@ -17,6 +17,9 @@
+ 
+ #include "display_configuration.h"
+ #include <winternl.h>
++/* Kyvenza: std::nothrow 用在本文件里,但从来没有直接包含 <new>。libstdc++ 会
++ * 顺带把它带进来,libc++ 不会,于是 clang 报 no member named 'nothrow'。 */
++#include <new>
+ #include <spice/macros.h>
+ 
+ /* The following definitions and structures are taken
+@@ -33,6 +36,12 @@
+ #define DISPLAYCONFIG_PATH_ACTIVE              0x00000001
+ #define DISPLAYCONFIG_PATH_MODE_IDX_INVALID    0xffffffff
+ 
++/* Kyvenza: vd_agent 0.10.0(2020)自己手写了这一整套 CCD API 声明,因为当年的
++ * mingw-w64 头文件里没有。现在的 mingw-w64 在 wingdi.h/winuser.h 里已经完整提供,
++ * 手写的这份就变成重复定义、编译直接失败。用 DISPLAYCONFIG_PATH_VALID_FLAGS 作
++ * 探针:它和这些类型在 wingdi.h 里同一段,老工具链两者都没有,新工具链两者都有。
++ * 上面那几个 #define 不用管,值与工具链完全一致,同值重定义是合法的。 */
++#ifndef DISPLAYCONFIG_PATH_VALID_FLAGS
+ enum DISPLAYCONFIG_DEVICE_INFO_TYPE {
+     DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME = 1
+ };
+@@ -153,6 +162,7 @@
+     DISPLAYCONFIG_PATH_TARGET_INFO targetInfo;
+     UINT32 flags;
+ };
++#endif /* !DISPLAYCONFIG_PATH_VALID_FLAGS */
+ 
+ /* The following definitions and structures are taken
+  * from here https://github.com/notr1ch/DWMCapture/blob/master/DWMCaptureSource.cpp */

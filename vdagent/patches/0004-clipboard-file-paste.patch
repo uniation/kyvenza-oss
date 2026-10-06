@@ -1,0 +1,346 @@
+--- a/vdagent/vdagent.cpp
++++ b/vdagent/vdagent.cpp
+@@ -27,7 +27,12 @@
+ #include <lmcons.h>
+ #include <queue>
+ #include <set>
++#include <string>
+ #include <vector>
++/* Kyvenza: DROPFILES 在这里。file_xfer.cpp 也是包这一个。 */
++#include <shlobj.h>
++/* Kyvenza: 落盘要以登录用户的身份做,理由见 vd_clip_files_root()。 */
++#include "as_user.h"
+ 
+ #define VD_AGENT_LOG_PATH       TEXT("%svdagent.log")
+ #define VD_AGENT_WINCLASS_NAME  TEXT("VDAGENT")
+@@ -36,6 +41,37 @@
+ #define VD_CLIPBOARD_TIMEOUT_MS 3000
+ #define VD_CLIPBOARD_FORMAT_MAX_TYPES 16
+ 
++/* Kyvenza: 把宿主复制的文件粘贴进客体。
++ *
++ * 协议里没有"文件"这种剪贴板格式 —— VD_AGENT_CLIPBOARD_* 到 IMAGE_JPG 就结束了,
++ * 所以在宿主上复制一个文件,Windows 这边的"粘贴"永远是灰的:资源管理器判断能不能
++ * 粘贴,看的就是剪贴板上有没有 CF_HDROP,而我们从来没往上放过。
++ *
++ * 6 这个号是我们自己占的,只有 Kyvenza 的宿主端会发。老版本的 agent 收到它时
++ * get_clipboard_format() 返回 0、这一项被跳过,不会出错 —— 所以宿主可以无条件宣告,
++ * 不必先问客体里装的是哪一版。
++ *
++ * 载荷是一整条消息(全部小端,与协议其余部分一致):
++ *
++ *     u32 count
++ *     重复 count 次: u32 name_len, name_len 字节 UTF-8 文件名, u64 size, size 字节内容
++ *
++ * 为什么把内容一起塞进这一条:Windows 的延迟渲染要求我们在 WM_RENDERFORMAT 返回
++ * 之前就把数据交出去,而 on_clipboard_request() 已经有一套"发 REQUEST、边等边泵
++ * 消息"的等待逻辑,文本和图片走的就是它。复用它就不必再造一条与 file_xfer 交织的
++ * 异步路径。等待是**空闲**超时(handle_chunk 每收到一个 chunk 就重置 _clipboard_tick),
++ * 所以大文件只要还在传就不会被判超时。
++ *
++ * Windows 粘贴文件是按路径粘的,没有"按值"这一说,所以内容要先落到 %TEMP% 下的一个
++ * 新目录里,HDROP 指向那里。 */
++#define VD_AGENT_CLIPBOARD_FILE_LIST 6
++#define VD_CLIP_FILES_MAX_COUNT 256
++#define VD_CLIP_FILES_DIR L"Kyvenza"
++#define VD_CLIP_FILES_PREFIX L"clip-"
++/* 粘贴完不能马上删:资源管理器是异步复制的,删早了它会复制到空文件。
++ * 所以只在下一次粘贴时清掉**足够旧**的那些。 */
++#define VD_CLIP_FILES_KEEP_MS (10 * 60 * 1000)
++
+ // only in vista+, not yet in mingw
+ #ifndef WM_CLIPBOARDUPDATE
+ #define WM_CLIPBOARDUPDATE      0x031D
+@@ -51,6 +87,8 @@
+     {CF_UNICODETEXT, {VD_AGENT_CLIPBOARD_UTF8_TEXT, 0}},
+     //FIXME: support more image types
+     {CF_DIB, {VD_AGENT_CLIPBOARD_IMAGE_PNG, VD_AGENT_CLIPBOARD_IMAGE_BMP, 0}},
++    /* Kyvenza: 只用于"宿主 -> 客体"。反方向在 on_clipboard_grab() 里显式跳过了。 */
++    {CF_HDROP, {VD_AGENT_CLIPBOARD_FILE_LIST, 0}},
+ };
+ 
+ #define clipboard_formats_count SPICE_N_ELEMENTS(clipboard_formats)
+@@ -701,8 +739,248 @@
+     reply->error = display_count ? VD_AGENT_SUCCESS : VD_AGENT_ERROR;
+     enqueue_chunk(reply_chunk);
+     return true;
++}
++
++/* Kyvenza: 宿主 -> 客体文件粘贴的实现,只被 handle_clipboard() 用到。写成文件内静态
++ * 函数而不是成员函数,是为了让这份补丁只动一个文件、不碰类声明。 */
++
++/* **必须是登录用户自己的临时目录,不能用 GetTempPath()。**
++ *
++ * 这份 agent 是 vdservice 拿 LocalSystem 的令牌拉起来的,GetTempPath() 读的是进程
++ * 环境变量,给出的是 C:\\Windows\\Temp —— 那个目录的 ACL 不给交互用户读。
++ * 于是 CF_HDROP 里放的是一串资源管理器**打不开**的路径,粘贴静静地什么也不做,
++ * 现象与"根本没收到文件"一模一样。2026-09-08 在真客体上就是这样翻的车。
++ *
++ * 调用方已经在 AsUser 里,所以 SHGetFolderPath 拿的是用户的 AppData\\Local;
++ * 环境变量不随模拟改变,这也是不能退回 GetTempPath() 的原因。 */
++static std::wstring vd_clip_files_root()
++{
++    WCHAR local_appdata[MAX_PATH];
++    std::wstring temp;
++
++    if (FAILED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA | CSIDL_FLAG_CREATE, NULL,
++                                SHGFP_TYPE_CURRENT, local_appdata))) {
++        vd_printf("Cannot resolve the user's local appdata: %lu", GetLastError());
++        return std::wstring();
++    }
++    temp = std::wstring(local_appdata) + L"\\Temp";
++    if (!CreateDirectoryW(temp.c_str(), NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
++        vd_printf("Cannot create the user's temp directory: %lu", GetLastError());
++        return std::wstring();
++    }
++    return temp + L"\\" + VD_CLIP_FILES_DIR;
++}
++
++/* 文件名来自另一个操作系统,一律当成不可信输入:任何能爬出目标目录的东西都拒收。 */
++static bool vd_clip_name_is_safe(const std::wstring& name)
++{
++    if (name.empty() || name.size() > 255 || name == L"." || name == L"..") {
++        return false;
++    }
++    return name.find_first_of(L"\\/:*?\"<>|") == std::wstring::npos &&
++           name.find(L'\0') == std::wstring::npos;
++}
++
++static bool vd_clip_utf8_to_wide(const uint8_t* data, uint32_t len, std::wstring& out)
++{
++    int wide_len = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
++                                       (LPCSTR)data, (int)len, NULL, 0);
++
++    if (wide_len <= 0) {
++        return false;
++    }
++    out.resize((size_t)wide_len);
++    return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, (LPCSTR)data, (int)len,
++                               &out[0], wide_len) == wide_len;
++}
++
++/* 清掉早先几次粘贴留下的目录,见 VD_CLIP_FILES_KEEP_MS 处的说明。 */
++static void vd_clip_purge_old(const std::wstring& root)
++{
++    WIN32_FIND_DATAW found;
++    FILETIME now_ft;
++    ULARGE_INTEGER now;
++    HANDLE search = FindFirstFileW((root + L"\\" + VD_CLIP_FILES_PREFIX + L"*").c_str(),
++                                   &found);
++
++    if (search == INVALID_HANDLE_VALUE) {
++        return;
++    }
++    GetSystemTimeAsFileTime(&now_ft);
++    now.LowPart = now_ft.dwLowDateTime;
++    now.HighPart = now_ft.dwHighDateTime;
++    do {
++        ULARGE_INTEGER then;
++        std::wstring dir;
++        WIN32_FIND_DATAW child;
++        HANDLE inner;
++
++        if (!(found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
++            continue;
++        }
++        then.LowPart = found.ftLastWriteTime.dwLowDateTime;
++        then.HighPart = found.ftLastWriteTime.dwHighDateTime;
++        /* FILETIME 是 100ns 一格。 */
++        if (now.QuadPart <= then.QuadPart ||
++            (now.QuadPart - then.QuadPart) / 10000 < VD_CLIP_FILES_KEEP_MS) {
++            continue;
++        }
++        dir = root + L"\\" + found.cFileName;
++        inner = FindFirstFileW((dir + L"\\*").c_str(), &child);
++        if (inner != INVALID_HANDLE_VALUE) {
++            do {
++                if (!(child.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
++                    DeleteFileW((dir + L"\\" + child.cFileName).c_str());
++                }
++            } while (FindNextFileW(inner, &child));
++            FindClose(inner);
++        }
++        RemoveDirectoryW(dir.c_str());
++    } while (FindNextFileW(search, &found));
++    FindClose(search);
++}
++
++static bool vd_clip_write_file(const std::wstring& path, const uint8_t* data, uint64_t size)
++{
++    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
++                              FILE_ATTRIBUTE_NORMAL, NULL);
++    bool ok = true;
++    DWORD err = 0;
++
++    if (file == INVALID_HANDLE_VALUE) {
++        vd_printf("Cannot create pasted file: %lu", GetLastError());
++        return false;
++    }
++    while (ok && size > 0) {
++        /* WriteFile 一次只收 DWORD 那么多。分片写顺便让极大的文件也不必一次交给内核。 */
++        DWORD take = (size > 1024 * 1024) ? 1024 * 1024 : (DWORD)size;
++        DWORD done = 0;
++
++        ok = !!WriteFile(file, data, take, &done, NULL) && done == take;
++        data += take;
++        size -= take;
++    }
++    /* 错误码要在 CloseHandle 之前取,它会把 last error 冲掉。 */
++    if (!ok) {
++        err = GetLastError();
++    }
++    CloseHandle(file);
++    if (!ok) {
++        vd_printf("Cannot write pasted file: %lu", err);
++        DeleteFileW(path.c_str());
++    }
++    return ok;
+ }
+ 
++/* 把宿主发来的文件表落到磁盘,并做出一个 CF_HDROP 句柄。 */
++static HGLOBAL vd_clip_hdrop_alloc(const uint8_t* data, uint32_t size)
++{
++    uint32_t pos;
++    uint32_t count = 0;
++    std::wstring root;
++    std::wstring dir;
++    std::wstring list;          /* DROPFILES 要的双 NUL 结尾路径表 */
++    HGLOBAL handle;
++    DROPFILES* drop;
++    AsUser as_user;             /* 析构时自动 RevertToSelf */
++
++    if (size < sizeof(count)) {
++        vd_printf("Clipboard file list is truncated");
++        return NULL;
++    }
++    memcpy(&count, data, sizeof(count));
++    pos = sizeof(count);
++    if (count == 0 || count > VD_CLIP_FILES_MAX_COUNT) {
++        vd_printf("Clipboard file list declares %u files, refusing", count);
++        return NULL;
++    }
++
++    /* 落盘要以登录用户的身份做:资源管理器是用户身份跑的,读不到 SYSTEM 的目录。
++     * file_xfer.cpp 把文件放到桌面时用的是同一个 AsUser。 */
++    if (!as_user.begin()) {
++        vd_printf("Clipboard file paste: cannot impersonate the logged-on user");
++        return NULL;
++    }
++
++    root = vd_clip_files_root();
++    if (root.empty()) {
++        return NULL;
++    }
++    CreateDirectoryW(root.c_str(), NULL);
++    vd_clip_purge_old(root);
++
++    dir = root + L"\\" + VD_CLIP_FILES_PREFIX +
++          std::to_wstring((unsigned long)GetCurrentProcessId()) + L"-" +
++          std::to_wstring((unsigned long)GetTickCount());
++    if (!CreateDirectoryW(dir.c_str(), NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
++        vd_printf("Cannot create clipboard file directory: %lu", GetLastError());
++        return NULL;
++    }
++
++    for (uint32_t i = 0; i < count; i++) {
++        uint32_t name_len = 0;
++        uint64_t file_size = 0;
++        std::wstring name;
++        std::wstring path;
++
++        if (size - pos < sizeof(name_len)) {
++            vd_printf("Clipboard file list is truncated");
++            return NULL;
++        }
++        memcpy(&name_len, data + pos, sizeof(name_len));
++        pos += sizeof(name_len);
++        if (name_len == 0 || size - pos < name_len) {
++            vd_printf("Clipboard file list is truncated");
++            return NULL;
++        }
++        if (!vd_clip_utf8_to_wide(data + pos, name_len, name) ||
++            !vd_clip_name_is_safe(name)) {
++            vd_printf("Clipboard file list has an unusable name, refusing");
++            return NULL;
++        }
++        pos += name_len;
++
++        if (size - pos < sizeof(file_size)) {
++            vd_printf("Clipboard file list is truncated");
++            return NULL;
++        }
++        memcpy(&file_size, data + pos, sizeof(file_size));
++        pos += sizeof(file_size);
++        if (file_size > (uint64_t)(size - pos)) {
++            vd_printf("Clipboard file list is truncated");
++            return NULL;
++        }
++
++        path = dir + L"\\" + name;
++        if (!vd_clip_write_file(path, data + pos, file_size)) {
++            return NULL;
++        }
++        pos += (uint32_t)file_size;
++
++        list += path;
++        list.push_back(L'\0');
++    }
++    list.push_back(L'\0');
++
++    handle = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT,
++                         sizeof(DROPFILES) + list.size() * sizeof(WCHAR));
++    if (!handle) {
++        vd_printf("Not enough memory for the pasted file list");
++        return NULL;
++    }
++    drop = (DROPFILES*)GlobalLock(handle);
++    if (!drop) {
++        GlobalFree(handle);
++        return NULL;
++    }
++    drop->pFiles = sizeof(DROPFILES);
++    drop->fWide = TRUE;
++    memcpy((uint8_t*)drop + sizeof(DROPFILES), list.data(), list.size() * sizeof(WCHAR));
++    GlobalUnlock(handle);
++    vd_printf("Pasted %u file(s) from the client", count);
++    return handle;
++}
++
+ bool VDAgent::handle_clipboard(VDAgentClipboard* clipboard, uint32_t size)
+ {
+     HANDLE clip_data;
+@@ -725,6 +1003,9 @@
+     case VD_AGENT_CLIPBOARD_IMAGE_BMP:
+         clip_data = get_image_handle(*clipboard, size, format);
+         break;
++    case VD_AGENT_CLIPBOARD_FILE_LIST:
++        clip_data = vd_clip_hdrop_alloc(clipboard->data, size);
++        break;
+     default:
+         vd_printf("Unsupported clipboard type %u", clipboard->type);
+         goto fin;
+@@ -733,6 +1014,12 @@
+         vd_printf("Unknown clipboard format, type %u", clipboard->type);
+         goto fin;
+     }
++    /* Kyvenza: 造句柄失败时**必须**在这里停下。往下走的话会 SetClipboardData(format, NULL),
++     * 那是"重新登记延迟渲染"的意思 —— 而我们正在渲染回调里,等于让 Windows 再问一次。 */
++    if (!clip_data) {
++        vd_printf("No clipboard data to set for type %u", clipboard->type);
++        goto fin;
++    }
+     ret = !!SetClipboardData(format, clip_data);
+     if (!ret) {
+         DWORD err = GetLastError();
+@@ -977,6 +1264,11 @@
+         return;
+     }
+     for (unsigned int i = 0; i < clipboard_formats_count; i++) {
++        /* Kyvenza: 文件只从宿主流向客体。在客体里复制文件时不要向宿主宣告 CF_HDROP ——
++         * 宿主没有实现反方向,宣告出去只会换来一次注定失败的索要。 */
++        if (clipboard_formats[i].format == CF_HDROP) {
++            continue;
++        }
+         if (IsClipboardFormatAvailable(clipboard_formats[i].format)) {
+             for (const uint32_t* ptype = clipboard_formats[i].types; *ptype; ptype++) {
+                 types[count++] = *ptype;

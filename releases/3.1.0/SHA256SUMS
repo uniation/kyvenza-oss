@@ -1,4 +1,4 @@
-e1acd7bd1738db3ea7190738378b2d61bf4c7a5b5621e2970c80dd5696cec1c2  ./README.md
+e6b65586095ec8a2cd7f2a12a70ef2de23bdc4962edbc5c593a5107f04a8624c  ./README.md
 85d99b79c981a404874c02e0342176cf75c7698e2b51fe41031cf6526d974f1a  ./lgpl/gettext-1.0.tar.gz
 170f5a29d2eb95b9dd1f1f754c0f9b90692c3d5dcf6db02c199c93e2c445177d  ./lgpl/gettext.rb
 17d15cac2af80a33271127408e0abc2748eb297c595c2a26409e81e14e7d1b8f  ./lgpl/glib-2.90.0.tar.xz
@@ -13,8 +13,8 @@ f5023fddff8b4111d7d80a87599910061cd021c91d758f146f5aefc0558f2726  ./scripts/asse
 448c1e6cfca693e8e0bbcac75c28b3811a6a3ebc65af48d592aed2c848a64a1b  ./scripts/assets/boot-logo.bmp
 e8c365dc9cff25440e88d150d9bf353984f0bb46480bb982e537fb203e043bf6  ./scripts/assets/kyvenza-k.svg
 173519d413a628da0cf6b7b3e9f0daa126f8c84850027a11b41fd61a7130ba40  ./scripts/build_firmware.sh
-d5487b9344d434cc861dc49a4cb83e84ddd2151c107ca825a4b65a64154bdbe6  ./scripts/build_qemu.sh
-d527f96d1ea21afe7a9d997fd63fcad2351d9131ff9d1c4e36336b32cbf78c6e  ./scripts/build_vdagent.sh
+2dfae0c302e338419cb6e35f42fd190b17596a8e8ef29f1d3842df7f01bbc778  ./scripts/build_qemu.sh
+2daf8805dec3c2f43f5ab8226bd4ef0d630897e2465b8492f5f57c77799d3409  ./scripts/build_vdagent.sh
 36ccab7b968e9304519c1ca49308ed6821b922fd4b2e98264753b22053bfbf87  ./scripts/sign_helpers.sh
 23430fafce5e6b93cbd2c0f224f5280302bec1e27cedb964a2060dc20d5ce8b9  ./scripts/stage_helpers.sh
 8a9c776dc5443e4091ae64b36a9248dfbe27632e95e10b444027b78764abac79  ./vdagent/patches/0001-stdint-defer-to-toolchain.patch

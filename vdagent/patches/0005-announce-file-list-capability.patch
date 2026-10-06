@@ -1,0 +1,38 @@
+From: Kyvenza <support@kyvenza.com>
+Date: Thu, 11 Sep 2026 10:00:00 +0800
+Subject: [PATCH] vdagent: announce a capability bit for the Kyvenza file-list clipboard format
+
+The host has no way to tell whether the agent inside the guest understands
+VD_AGENT_CLIPBOARD_FILE_LIST (patch 0004).  An older agent simply skips the
+format, so pasting files from the host silently does nothing and the user has
+no clue that the guest tools need a reinstall.
+
+Announce capability bit 28, chosen well above VD_AGENT_END_CAP (14) and inside
+the single uint32_t the capabilities bitmap has.  The host treats a missing bit
+as "guest tools out of date" and says so in the UI.
+
+Signed-off-by: Kyvenza <support@kyvenza.com>
+---
+--- a/vdagent/vdagent.cpp
++++ b/vdagent/vdagent.cpp
+@@ -71,6 +71,11 @@
+ /* 粘贴完不能马上删:资源管理器是异步复制的,删早了它会复制到空文件。
+  * 所以只在下一次粘贴时清掉**足够旧**的那些。 */
+ #define VD_CLIP_FILES_KEEP_MS (10 * 60 * 1000)
++/* Kyvenza: 能力位 28,也是我们自己占的号(上游到 FILE_XFER_DETAILED_ERRORS = 14 为止,
++ * 位图只有一个 u32,28 在范围内)。宿主靠它判断客体里装的 agent 认不认上面那个
++ * 文件粘贴格式:老版本不宣告这一位,宿主就能在界面上提示"客体工具需要更新",
++ * 而不是让用户对着一个"粘贴了什么也没发生"的剪贴板猜。 */
++#define VD_AGENT_CAP_KYVENZA_CLIPBOARD_FILE_LIST 28
+ 
+ // only in vista+, not yet in mingw
+ #ifndef WM_CLIPBOARDUPDATE
+@@ -1121,6 +1126,8 @@
+     VD_AGENT_SET_CAPABILITY(caps->caps, VD_AGENT_CAP_SPARSE_MONITORS_CONFIG);
+     VD_AGENT_SET_CAPABILITY(caps->caps, VD_AGENT_CAP_GUEST_LINEEND_CRLF);
+     VD_AGENT_SET_CAPABILITY(caps->caps, VD_AGENT_CAP_MAX_CLIPBOARD);
++    /* Kyvenza: 见 VD_AGENT_CAP_KYVENZA_CLIPBOARD_FILE_LIST 处的说明。 */
++    VD_AGENT_SET_CAPABILITY(caps->caps, VD_AGENT_CAP_KYVENZA_CLIPBOARD_FILE_LIST);
+     vd_printf("Sending capabilities:");
+     for (uint32_t i = 0 ; i < caps_size; ++i) {
+         vd_printf("%X", caps->caps[i]);

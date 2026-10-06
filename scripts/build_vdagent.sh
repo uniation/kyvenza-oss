@@ -123,9 +123,21 @@ fi
 fetch "$VDAGENT_URL" "${SRC}/vdagent-win-${VDAGENT_VER}.tar.xz" "$VDAGENT_SHA"
 rm -rf "${SRC}/vdagent-win-${VDAGENT_VER}"
 tar -xf "${SRC}/vdagent-win-${VDAGENT_VER}.tar.xz" -C "${SRC}"
+# 补丁目录:仓库里在脚本旁,源码交付包里在 `vdagent/patches/`(脚本在 `scripts/`)。
+VDAGENT_PATCH_DIR=""
+for c in "${VDAGENT_PATCH_DIR_OVERRIDE:-}" "${DIR}/patches" "${DIR}/../vdagent/patches"; do
+    if [ -n "$c" ] && ls "$c"/*.patch >/dev/null 2>&1; then
+        VDAGENT_PATCH_DIR="$(cd "$c" && pwd)"
+        break
+    fi
+done
+[ -n "$VDAGENT_PATCH_DIR" ] || {
+    echo "找不到 vd_agent 补丁(试过 ${DIR}/patches 与 ${DIR}/../vdagent/patches),没有它们编不出 ARM64 版本" >&2
+    exit 1
+}
 (
     cd "${SRC}/vdagent-win-${VDAGENT_VER}"
-    for patch in "${DIR}"/patches/*.patch; do
+    for patch in "${VDAGENT_PATCH_DIR}"/*.patch; do
         echo "==> 施加 $(basename "$patch")"
         patch -p1 --no-backup-if-mismatch < "$patch"
     done

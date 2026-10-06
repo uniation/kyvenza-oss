@@ -1,0 +1,30 @@
+--- a/common/stdint.h
++++ b/common/stdint.h
+@@ -36,6 +36,20 @@
+ 
+ 
+ 
++/* Kyvenza: 这份垫片是 2000 年为没有 stdint.h 的老 MSVC 写的。Makefile.am 里的
++ * -I./common 会让它遮蔽工具链自带的 <stdint.h>,在 mingw 上后果是 CRT 头文件链
++ * 断掉(corecrt_wctype.h 报 wctype_t 未定义)。而且它对 64 位本身就是错的:
++ * SIZE_MAX / PTRDIFF_MAX / INTPTR_MAX 全硬编码成 32 位值。
++ * 任何自带 stdint.h 的编译器都应当用真正的那一份。
++ *
++ * include_next 必须放在 _STDINT_H 之前:mingw-w64 自己的 stdint.h 用的正是这个
++ * guard 名,先定义就会把真正那份变成空文件(症状是 uint32_t 未定义)。 */
++#if defined(__GNUC__) || defined(__clang__) || (defined(_MSC_VER) && _MSC_VER >= 1600)
++
++#include_next <stdint.h>
++
++#else
++
+ #ifndef _STDINT_H
+ 
+ #define _STDINT_H
+@@ -396,5 +410,4 @@
+ 
+ #endif
+ 
+-
+-
++#endif /* 没有自带 stdint.h 的老编译器 */

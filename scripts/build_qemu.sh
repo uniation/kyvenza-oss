@@ -95,13 +95,30 @@ CONFIGURE_ARGS=(
 # 脚本照样拿旧产物往下走,交付的源码与随包二进制对不上,GPLv2「完整对应源码」
 # 也就不成立了。所以把所有输入合成一个指纹,变了就三个目录一起清掉重来。
 # (--python 不算输入:它只决定用哪个解释器跑 configure,不影响产物。)
+# 补丁目录。仓库里是脚本旁的 `patches/`;源码交付包里脚本在 `scripts/`、补丁在
+# `qemu/patches/`(见 collect_sources.sh)。以前只认前者,照交付包重建时 nullglob
+# 让循环一个补丁都不打、也不报错,建出来的 QEMU 与我们分发的二进制对不上(GPLv2 §3)。
+# 两处都没有就直接失败,绝不静默地"无补丁构建"。
+resolve_patch_dir() {
+    local c
+    for c in "${QEMU_PATCH_DIR:-}" "${DIR}/patches" "${DIR}/../qemu/patches"; do
+        [ -n "$c" ] && [ -d "$c" ] && { (cd "$c" && pwd); return 0; }
+    done
+    return 1
+}
+PATCH_DIR="$(resolve_patch_dir)" || {
+    echo "找不到 QEMU 补丁目录(试过 ${DIR}/patches 与 ${DIR}/../qemu/patches)。" >&2
+    echo "拒绝在没有补丁的情况下构建:那样得到的不是我们分发的那份 QEMU。" >&2
+    exit 1
+}
+
 fingerprint_inputs() {
     echo "version=${QEMU_VERSION}"
     echo "sha256=${QEMU_SHA256}"
     echo "sdk=$(basename "$SDKROOT")"
     printf 'arg=%s\n' "${CONFIGURE_ARGS[@]}" | grep -v '^arg=--python='
     shopt -s nullglob
-    for p in "${DIR}"/patches/*.patch; do
+    for p in "${PATCH_DIR}"/*.patch; do
         echo "patch=$(basename "$p") $(shasum -a 256 "$p" | awk '{print $1}')"
     done
     shopt -u nullglob
@@ -159,7 +176,7 @@ fi
 # ── 打补丁 ─────────────────────────────────────────────────────────
 # `patch -N` 让脚本可以反复跑(已打过的跳过)。
 shopt -s nullglob
-for p in "${DIR}"/patches/*.patch; do
+for p in "${PATCH_DIR}"/*.patch; do
     if patch -p1 -N -s --dry-run -d "$SRC" < "$p" >/dev/null 2>&1; then
         echo "==> 打补丁 $(basename "$p")"
         patch -p1 -N -s -d "$SRC" < "$p"
@@ -171,6 +188,7 @@ for p in "${DIR}"/patches/*.patch; do
     fi
 done
 shopt -u nullglob
+echo "==> 补丁目录 ${PATCH_DIR}(共 $(find "$PATCH_DIR" -maxdepth 1 -name '*.patch' | wc -l | tr -d ' ') 个)"
 
 # ── configure ──────────────────────────────────────────────────────
 mkdir -p "$BUILD"

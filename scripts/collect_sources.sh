@@ -64,10 +64,13 @@ fetch() {
     # 这个固定站点,ftpmirror 留作回退。
     #
     # 换源是安全的:sha256 在下面钉死,取到的字节不一致一样会被拒。
+    #
+    # 2026-10-07 重传 3.1.0 源码时 ftp.gnu.org 与 ftpmirror 都在 TLS 握手阶段失败,
+    # kernel.org 的 GNU 镜像正常,所以把它排在最后兜底。
     local urls="$url"
     case "$url" in
         https://ftpmirror.gnu.org/*)
-            urls="${url/ftpmirror.gnu.org/ftp.gnu.org} $url"
+            urls="${url/ftpmirror.gnu.org/ftp.gnu.org} $url ${url/ftpmirror.gnu.org/mirrors.kernel.org}"
             ;;
     esac
     local ok=0 u
@@ -106,9 +109,8 @@ else
         "${OUT}/qemu/qemu-${QEMU_VERSION}.tar.xz" "$QEMU_SHA256"
 fi
 
-# 补丁目录。**当前为空 —— 这是有意的,不是漏了**:我们没有对 QEMU 源码做任何改动,
-# 全部差异都在 configure 开关上。将来一旦加补丁,build_qemu.sh 会自动施加,
-# 这里也会自动带上。
+# 补丁目录。交付包里放在 `qemu/patches/`,build_qemu.sh 在 `scripts/` 下会自动
+# 找到 `../qemu/patches`(仓库里则是脚本旁的 `patches/`)。没有补丁时写一份 README 说明。
 mkdir -p "${OUT}/qemu/patches"
 shopt -s nullglob
 PATCHES=("${DIR}"/patches/*.patch)
