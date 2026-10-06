@@ -118,6 +118,28 @@ while read -r lib; do
 done < "$SEEN_FILE"
 chmod u+w "${FRAMEWORKS}"/*.dylib
 
+# ── 许可白名单 ─────────────────────────────────────────────────────
+# 上面的闭包是**自动展开**的,而 collect_sources.sh 里的 LGPL 清单是写死的。Homebrew
+# 哪天让 swtpm 多链一个 libtasn1、gnutls,它会被静默打进包里,却没有对应源码。
+# 所以每个进包的 dylib 都必须在这里归过类,没归类的直接失败。
+#   LGPL:必须同时出现在 collect_sources.sh 的 LGPL_SPECS 里(那边会核对版本)
+#   宽松许可(MIT / BSD / Apache):不要求交付源码,Open Source Notices 里列出即可
+for lib in "${FRAMEWORKS}"/*.dylib; do
+    case "$(basename "$lib")" in
+        libglib-2.0.*|libgio-2.0.*|libgmodule-2.0.*|libgobject-2.0.*) ;;  # LGPL-2.1+ → glib
+        libjson-glib-1.0.*) ;;                                            # LGPL-2.1+ → json-glib
+        libintl.*) ;;                                                     # LGPL-2.1+ → gettext
+        libpixman-1.*) ;;                                                 # MIT
+        libslirp.*|libpcre2-8.*|libtpms.*|libswtpm_libtpms.*) ;;          # BSD
+        libcrypto.*) ;;                                                   # Apache-2.0 (OpenSSL)
+        *)
+            die "$(basename "$lib") 不在许可白名单里。先查清它的许可:LGPL/GPL 的要加进
+  collect_sources.sh 的 LGPL_SPECS 并交付源码,宽松许可的加进 Open Source Notices;
+  然后在 stage_helpers.sh 的白名单里给它归类。"
+            ;;
+    esac
+done
+
 # ── 改写 install name ──────────────────────────────────────────────
 rewrite() {
     local target="$1" prefix="$2" dep base

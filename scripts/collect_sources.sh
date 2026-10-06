@@ -23,14 +23,21 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 OUT="${ROOT}/dist/oss-sources"
 
-QEMU_VERSION="${QEMU_VERSION:-11.1.0}"
-QEMU_SHA256="6ee1d1a61f68212476b27108c26da5f449dc09b626d42f8279ba0dc2e08fa858"
+# 版本与 sha256 **只在构建脚本里写一份**,这里读出来用。以前两边各抄一份、互不校验:
+# 只改了构建脚本的默认版本时 `--check` 照样通过,交付包却还是旧版本的源码。
+# 构建脚本是「构建方式」,这里是「对应源码」,两者必须是同一个数。
+read_default() {  # read_default <文件> <变量名>:取 VAR="${VAR:-x}" 或 VAR=x 里的 x
+    local value
+    value="$(sed -nE "s/^$2=\"?\\$\{$2:-([^}]+)\}\"?$/\1/p; s/^$2=\"?([^\"$]+)\"?$/\1/p" "$1" | head -n1)"
+    [ -n "$value" ] || die "从 $1 读不出 $2"
+    echo "$value"
+}
+QEMU_VERSION="${QEMU_VERSION:-$(read_default "${DIR}/build_qemu.sh" QEMU_VERSION)}"
+QEMU_SHA256="$(read_default "${DIR}/build_qemu.sh" QEMU_SHA256)"
 
-# SPICE vd_agent(GPLv2+)。跑在**客体里**,随驱动光盘分发。
-# 版本与 sha256 必须与 scripts/guest-tools/build_vdagent.sh 里的一致 ——
-# 那份脚本是构建方式,这里是对应源码,两者对不上就等于没履行义务。
-VDAGENT_VERSION="0.10.0"
-VDAGENT_SHA256="918be9638164212d1787f9a9107584c5445adc638e592ae9260ec0797b25020d"
+# SPICE vd_agent(GPLv2+)。跑在**客体里**,随驱动光盘分发。同样取自构建脚本。
+VDAGENT_VERSION="$(read_default "${ROOT}/scripts/guest-tools/build_vdagent.sh" VDAGENT_VER)"
+VDAGENT_SHA256="$(read_default "${ROOT}/scripts/guest-tools/build_vdagent.sh" VDAGENT_SHA)"
 
 # LGPL 组件。版本必须与随包 dylib 实际构建自的版本一致 —— 我们用的是 Homebrew 的
 # 二进制,所以这里的版本、URL、sha256 全部取自对应 formula 的 stable 段
