@@ -23,7 +23,7 @@ The upstream tarballs are large and are not stored in git. Complete source
 archives are published per release, at:
 
 ```
-https://download.kyvenza.com/source/<version>/
+download.kyvenza.com/source/<version>/
 ```
 
 Each directory contains the exact QEMU release we built, the LGPL library
