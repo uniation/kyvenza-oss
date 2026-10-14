@@ -53,6 +53,15 @@ if [ -z "${QEMU_SDKROOT:-}" ] || [ ! -d "$QEMU_SDKROOT" ]; then
 fi
 export SDKROOT="$QEMU_SDKROOT"
 
+# ── 部署目标 ──────────────────────────────────────────────────────
+# **钉死部署目标。** 不设的话 clang 取「本机系统版本」当最低系统:在 macOS 27 上建出来
+# 的 QEMU 是 minos 27.0,macOS 26 上 dyld 直接拒绝加载,Windows 虚拟机整个起不来。
+# 值必须等于 Info.plist 的 KyvenzaWindowsMinimumSystemVersion(26.0)。要抬高它是在
+# 放弃 macOS 26 用户,不是改个数字;因此它计入构建指纹,并在构建结束后核对产物。
+# 依赖库(glib、pcre2、libcrypto)同理,见 build_deps26.sh。
+QEMU_DEPLOYMENT_TARGET="${QEMU_DEPLOYMENT_TARGET:-26.0}"
+export MACOSX_DEPLOYMENT_TARGET="$QEMU_DEPLOYMENT_TARGET"
+
 # ── configure 参数 ─────────────────────────────────────────────────
 # 抽成数组,是因为它和下面的构建指纹要共用同一份:参数改了,指纹必须跟着变。
 # 每一项砍掉的理由见 configure 段落的注释。
@@ -116,6 +125,7 @@ fingerprint_inputs() {
     echo "version=${QEMU_VERSION}"
     echo "sha256=${QEMU_SHA256}"
     echo "sdk=$(basename "$SDKROOT")"
+    echo "deployment_target=${QEMU_DEPLOYMENT_TARGET}"
     printf 'arg=%s\n' "${CONFIGURE_ARGS[@]}" | grep -v '^arg=--python='
     shopt -s nullglob
     for p in "${PATCH_DIR}"/*.patch; do
@@ -229,6 +239,14 @@ case "$BUILT_VERSION" in
         exit 1
         ;;
 esac
+# 产物的最低系统版本不得高于钉死的部署目标(防止某个子构建绕过环境变量)。
+for bin in qemu-system-aarch64 qemu-img; do
+    MINOS="$(otool -l "${PREFIX}/bin/${bin}" | awk '/LC_BUILD_VERSION/{f=1} f&&/minos/{print $2; exit}')"
+    if [ -n "$MINOS" ] && [ "$(printf '%s\n%s\n' "$MINOS" "$QEMU_DEPLOYMENT_TARGET" | sort -V | tail -1)" != "$QEMU_DEPLOYMENT_TARGET" ]; then
+        echo "${bin} 的 minos 是 ${MINOS},高于部署目标 ${QEMU_DEPLOYMENT_TARGET},拒绝继续" >&2
+        exit 1
+    fi
+done
 # 指纹只在整条构建成功之后写:中途失败的话下次仍会从头来。
 echo "$FINGERPRINT" > "$STAMP_FILE"
 echo

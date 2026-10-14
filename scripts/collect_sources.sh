@@ -44,11 +44,14 @@ VDAGENT_SHA256="$(read_default "${ROOT}/scripts/guest-tools/build_vdagent.sh" VD
 # (`brew info --json=v2 <formula>`)。**升级 Homebrew 依赖后必须回来更新这三行**,
 # 否则交付的源码对不上实际分发的二进制,义务没有履行。
 #
+# **glib 不在这张表里**:它随包的那份是 build_deps26.sh 按 macOS 26.0 部署目标从源码重编的
+# (Homebrew 只给最新系统出 bottle,在 macOS 27 上升级后会变成要求 27.0),版本与 sha256
+# 钉在那个脚本里,下面单独处理。
+#
 # 以前「必须回来更新」只靠人记得:2026-09-20 Homebrew 把 glib 升到 2.90.0,
 # 9-23 打的 MAS 3.0.2 就带着 2.90.0 出去了,而这里还写着 2.88.3。现在下面会逐个
 # 比对 Homebrew 实际装的版本,不一致直接失败。
 LGPL_SPECS="
-glib|2.90.0|https://download.gnome.org/sources/glib/2.90/glib-2.90.0.tar.xz|17d15cac2af80a33271127408e0abc2748eb297c595c2a26409e81e14e7d1b8f
 json-glib|1.10.8|https://download.gnome.org/sources/json-glib/1.10/json-glib-1.10.8.tar.xz|55c5c141a564245b8f8fbe7698663c87a45a7333c2a2c56f06f811ab73b212dd
 gettext|1.0|https://ftpmirror.gnu.org/gnu/gettext/gettext-1.0.tar.gz|85d99b79c981a404874c02e0342176cf75c7698e2b51fe41031cf6526d974f1a
 "
@@ -162,7 +165,7 @@ echo "    补丁 ${#VDAGENT_PATCHES[@]} 个"
 
 # ── 构建方式(GPLv2 §3 明文要求)────────────────────────────────
 echo "==> 构建脚本"
-for s in build_qemu.sh build_firmware.sh stage_helpers.sh sign_helpers.sh; do
+for s in build_qemu.sh build_deps26.sh build_firmware.sh stage_helpers.sh sign_helpers.sh; do
     cp "${DIR}/${s}" "${OUT}/scripts/"
     echo "    ${s}"
 done
@@ -179,9 +182,9 @@ if [ -d "${DIR}/assets" ]; then
 fi
 
 # ── LGPL 组件 ──────────────────────────────────────────────────────
-# 随包的是 Homebrew 构建的 dylib,所以"对应源码"= 上游 tarball + Homebrew formula
-# (里面写着构建参数,glib 还带一个把硬编码路径改成 Homebrew 路径的补丁)。
-# 只给上游 tarball 是不够的 —— formula 才是我们这份二进制的实际构建方式。
+# json-glib 与 gettext 随包的是 Homebrew 构建的 dylib,所以"对应源码"= 上游 tarball + Homebrew
+# formula(里面写着构建参数)。只给上游 tarball 是不够的 —— formula 才是我们这份二进制的
+# 实际构建方式。glib 另有专段,见下。
 echo "==> LGPL 组件"
 echo "$LGPL_SPECS" | while IFS='|' read -r name version url sha; do
     [ -n "$name" ] || continue
@@ -201,16 +204,24 @@ echo "$LGPL_SPECS" | while IFS='|' read -r name version url sha; do
     echo "    formula ${name}.rb"
 done
 
-# glib 的 formula 引用了 homebrew-core 里的一个补丁文件,本地 API 安装模式下
-# 不存在,从上游仓库取。少了它,交付的就不是我们这份 dylib 的完整对应源码。
-#
-# 取的是 HEAD,所以**哈希钉死**:API 安装模式不记录 tap 的 commit,没法按构建时的
-# 版本去取;上游一旦改了这个补丁,这里就失败,由人确认随包那份 glib 用的是哪一版
-# 再更新哈希。2025-10-15 之后它没变过,3.0.1 交付的也是这一份。
-GLIB_PATCH_URL="https://raw.githubusercontent.com/Homebrew/homebrew-core/HEAD/Patches/glib/hardcoded-paths.diff"
-GLIB_PATCH_SHA256="d846efd0bf62918350da94f850db33b0f8727fece9bfaf8164566e3094e80c97"
-echo "  glib Homebrew 补丁"
-fetch "$GLIB_PATCH_URL" "${OUT}/lgpl/glib-homebrew-hardcoded-paths.diff" "$GLIB_PATCH_SHA256"
+# ── glib:build_deps26.sh 重编的那份 ────────────────────────────────
+# 随包的 libglib/libgobject/libgmodule/libgio 不是 Homebrew 的二进制,而是 build_deps26.sh
+# 用下面这份上游 tarball 按 macOS 26.0 部署目标编的,所以"对应源码"= 这份 tarball +
+# build_deps26.sh(已随脚本一起交付)。不再有 Homebrew formula 与它的补丁。
+# 版本与 sha256 从 build_deps26.sh 读,和构建脚本是同一个数;并核对重编产物的戳,
+# 防止交付的源码与实际打进包里的 glib 不是同一个版本。
+echo "  glib(build_deps26.sh)"
+DEPS26_SCRIPT="${DIR}/build_deps26.sh"
+GLIB_VERSION="$(read_default "$DEPS26_SCRIPT" GLIB_VERSION)"
+GLIB_SHA256="$(read_default "$DEPS26_SCRIPT" GLIB_SHA256)"
+GLIB_SERIES="${GLIB_VERSION%.*}"
+GLIB_URL="https://download.gnome.org/sources/glib/${GLIB_SERIES}/glib-${GLIB_VERSION}.tar.xz"
+DEPS26_STAMP="${ROOT}/.local/qemu/deps26/build.stamp"
+[ -f "$DEPS26_STAMP" ] || die "没有 ${DEPS26_STAMP}:先跑 make deps26 并重新组包,随包的 glib 才是这份源码对应的那个"
+grep -q "glib=${GLIB_VERSION} " "$DEPS26_STAMP" || die "deps26 产物的戳里 glib 不是 ${GLIB_VERSION}:${DEPS26_STAMP}
+  先 FORCE=1 make deps26 并重新组包"
+echo "    ${GLIB_VERSION}"
+fetch "$GLIB_URL" "${OUT}/lgpl/$(basename "$GLIB_URL")" "$GLIB_SHA256"
 
 cp "${ROOT}/docs/oss-sources-README.md" "${OUT}/README.md"
 

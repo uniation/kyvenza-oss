@@ -118,6 +118,23 @@ while read -r lib; do
 done < "$SEEN_FILE"
 chmod u+w "${FRAMEWORKS}"/*.dylib
 
+# ── 用 26.0 部署目标重编的库覆盖进去 ───────────────────────────────
+# Homebrew 只为最新的 macOS 出 bottle,在 macOS 27 机器上升级后 glib / pcre2 / libcrypto
+# 的 minos 会变成 27.0,macOS 26 上 dyld 拒绝加载。build_deps26.sh 从源码按 26.0 重编这几个,
+# 这里按文件名覆盖。只覆盖闭包里本来就有的库,不往包里新增任何东西;名字相同、
+# soname 版本相同,所以依赖它们的 QEMU / swtpm 不用重编。
+DEPS26_LIB="${ROOT}/.local/qemu/deps26/lib"
+if [ -f "${ROOT}/.local/qemu/deps26/build.stamp" ]; then
+    for lib in "${FRAMEWORKS}"/*.dylib; do
+        base="$(basename "$lib")"
+        if [ -f "${DEPS26_LIB}/${base}" ] && [ ! -L "${DEPS26_LIB}/${base}" ]; then
+            cp "${DEPS26_LIB}/${base}" "$lib"
+            chmod u+w "$lib"
+            echo "stage_helpers: ${base} 用 26.0 部署目标的重编版本"
+        fi
+    done
+fi
+
 # ── 许可白名单 ─────────────────────────────────────────────────────
 # 上面的闭包是**自动展开**的,而 collect_sources.sh 里的 LGPL 清单是写死的。Homebrew
 # 哪天让 swtpm 多链一个 libtasn1、gnutls,它会被静默打进包里,却没有对应源码。
@@ -547,7 +564,8 @@ if [ -n "$DECLARED" ]; then
     HIGHER="$(printf '%s\n%s\n' "$DECLARED" "$REQUIRED" | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)"
     if [ "$HIGHER" != "$DECLARED" ] && [ "$REQUIRED" != "$DECLARED" ]; then
         require "随包二进制要求 macOS ${REQUIRED},但 Info.plist 声明 Windows 只要 ${DECLARED}。
-  老系统上用户能建 Windows 却起不来。把 KyvenzaWindowsMinimumSystemVersion 调到 ${REQUIRED},
+  老系统上用户能建 Windows 却起不来。先跑 make deps26(scripts/qemu/build_deps26.sh):把这些库按 26.0 部署目标重编;
+  不行再考虑把 KyvenzaWindowsMinimumSystemVersion 调到 ${REQUIRED},
   并同步官网与 App Store 上的系统要求说明。"
     fi
     echo "stage_helpers: Windows 门槛 macOS ${DECLARED},随包二进制最高要求 ${REQUIRED}"

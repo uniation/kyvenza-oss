@@ -23,11 +23,11 @@ The upstream tarballs are large and are not stored in git. Complete source
 archives are published per release, at:
 
 ```
-download.kyvenza.com/source/<version>/
+https://download.kyvenza.com/source/<version>/
 ```
 
 Each directory contains the exact QEMU release we built, the LGPL library
-sources, the Homebrew formulae we built them with, these scripts, and a
+sources, the build recipes we used (our scripts for GLib, Homebrew formulae for the rest), these scripts, and a
 `SHA256SUMS` covering everything. The `releases/` directory in this repository
 keeps a git-tracked copy of each release's `SHA256SUMS`, so the delivered bytes
 can be checked against a record we cannot quietly rewrite.
