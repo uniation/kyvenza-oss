@@ -32,7 +32,16 @@ APP="${1:?用法: stage_helpers.sh <app-bundle-path>}"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 
 QEMU_PREFIX="${QEMU_PREFIX:-${ROOT}/.local/qemu/install}"
-SWTPM_BIN="${SWTPM_BIN:-$(command -v swtpm || true)}"
+# 随包的依赖库与 swtpm 都取自 build_deps26.sh 按 macOS 26.0 重编的产物(见下面「覆盖」一段)。
+DEPS26_PREFIX="${ROOT}/.local/qemu/deps26"
+DEPS26_STAMP="${DEPS26_PREFIX}/build.stamp"
+if [ -z "${SWTPM_BIN:-}" ]; then
+    if [ -f "$DEPS26_STAMP" ] && [ -x "${DEPS26_PREFIX}/bin/swtpm" ]; then
+        SWTPM_BIN="${DEPS26_PREFIX}/bin/swtpm"
+    else
+        SWTPM_BIN="$(command -v swtpm || true)"
+    fi
+fi
 FIRMWARE_DIR="${FIRMWARE_DIR:-${ROOT}/.local/qemu/firmware}"
 VIRTIO_WIN_ISO="${VIRTIO_WIN_ISO:-${ROOT}/.local/qemu/virtio-win.iso}"
 
@@ -47,7 +56,7 @@ die() { echo "stage_helpers: $*" >&2; exit 1; }
 [ -x "${QEMU_PREFIX}/bin/qemu-system-aarch64" ] || \
     die "缺 QEMU,先跑 scripts/qemu/build_qemu.sh"
 [ -n "$SWTPM_BIN" ] && [ -x "$SWTPM_BIN" ] || \
-    die "缺 swtpm(brew install swtpm)。没有它 Windows 客体装不了"
+    die "缺 swtpm,先跑 make deps26。没有它 Windows 客体装不了"
 [ -f "${FIRMWARE_DIR}/secboot-code.fd" ] || \
     die "缺固件 ${FIRMWARE_DIR}/secboot-code.fd,先跑 scripts/qemu/build_firmware.sh"
 [ -f "${FIRMWARE_DIR}/secboot-vars.fd" ] || \
@@ -74,6 +83,9 @@ if [ "$QEMU_PREFIX" = "${ROOT}/.local/qemu/install" ]; then
     bash "${ROOT}/scripts/qemu/build_qemu.sh" --check >/dev/null 2>&1 || \
         require "随包 QEMU 与当前 build_qemu.sh / patches 不对应(或从未记录指纹),先跑 make qemu"
 fi
+# swtpm 是可执行文件,不走下面按文件名覆盖 dylib 的那条路,所以在这里单独把关。
+[ "$SWTPM_BIN" = "${DEPS26_PREFIX}/bin/swtpm" ] && [ -f "$DEPS26_STAMP" ] || \
+    require "swtpm 取自 ${SWTPM_BIN},不是 build_deps26.sh 的产物。先跑 make deps26"
 
 rm -rf "$HELPERS" "$DATA"
 mkdir -p "$HELPERS" "$FRAMEWORKS" "$DATA"
@@ -114,33 +126,52 @@ done
 HELPERS_REAL="$(/usr/bin/python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$HELPERS")"
 while read -r lib; do
     case "$lib" in "${HELPERS}/"*|"${HELPERS_REAL}/"*) continue ;; esac
+    # 同名库可能出现两次:QEMU 记的是 Homebrew 路径,swtpm 记的是 deps26 路径。Homebrew 的
+    # 文件是只读的,先拷进来的那份会让第二次 cp 报 Permission denied,所以先删再拷。
+    # 拷哪一份无所谓,下面会统一换成 deps26 的。
+    rm -f "${FRAMEWORKS}/$(basename "$lib")"
     cp "$lib" "${FRAMEWORKS}/$(basename "$lib")"
 done < "$SEEN_FILE"
 chmod u+w "${FRAMEWORKS}"/*.dylib
 
 # ── 用 26.0 部署目标重编的库覆盖进去 ───────────────────────────────
-# Homebrew 只为最新的 macOS 出 bottle,在 macOS 27 机器上升级后 glib / pcre2 / libcrypto
-# 的 minos 会变成 27.0,macOS 26 上 dyld 拒绝加载。build_deps26.sh 从源码按 26.0 重编这几个,
-# 这里按文件名覆盖。只覆盖闭包里本来就有的库,不往包里新增任何东西;名字相同、
-# soname 版本相同,所以依赖它们的 QEMU / swtpm 不用重编。
-DEPS26_LIB="${ROOT}/.local/qemu/deps26/lib"
-if [ -f "${ROOT}/.local/qemu/deps26/build.stamp" ]; then
+# Homebrew 只为最新的 macOS 出 bottle,在 macOS 27 机器上升级或新装后,闭包里的每个库 minos
+# 都会变成 27.0,macOS 26 上 dyld 拒绝加载。build_deps26.sh 从源码按 26.0 重编了全部这些库,
+# 这里按文件名覆盖(重编产物可能在 lib/ 的子目录里,比如 lib/swtpm/libswtpm_libtpms)。
+# 只覆盖闭包里本来就有的库,不往包里新增任何东西;名字相同、soname 版本相同,
+# 所以依赖它们的 QEMU 不用重编。
+# 上面的闭包仍从 QEMU 实际记录的 Homebrew 路径展开:那是「QEMU 需要哪些库」的依据。
+DEPS26_LIB="${DEPS26_PREFIX}/lib"
+REPLACED_FILE="$(mktemp)"
+trap 'rm -f "$QUEUE_FILE" "$SEEN_FILE" "$REPLACED_FILE"' EXIT
+if [ -f "$DEPS26_STAMP" ]; then
     for lib in "${FRAMEWORKS}"/*.dylib; do
         base="$(basename "$lib")"
-        if [ -f "${DEPS26_LIB}/${base}" ] && [ ! -L "${DEPS26_LIB}/${base}" ]; then
-            cp "${DEPS26_LIB}/${base}" "$lib"
+        src="$(find "$DEPS26_LIB" -type f -name "$base" | head -1)"
+        if [ -n "$src" ]; then
+            cp "$src" "$lib"
             chmod u+w "$lib"
+            echo "$base" >> "$REPLACED_FILE"
             echo "stage_helpers: ${base} 用 26.0 部署目标的重编版本"
         fi
     done
 fi
+# 每一个进包的库都必须是重编产物。漏一个,就是有个 Homebrew 的二进制被带进了包:
+# 今天它恰好还是 26.0,哪台机器 brew upgrade 一次就变成 27.0(2026-10-20 新装的机器上就是这样)。
+# 闭包里冒出一个 build_deps26.sh 没编的新库,也停在这里,而不是等最后那道 minos 守卫碰运气。
+NOT_REBUILT=""
+for lib in "${FRAMEWORKS}"/*.dylib; do
+    grep -qxF "$(basename "$lib")" "$REPLACED_FILE" || NOT_REBUILT="${NOT_REBUILT} $(basename "$lib")"
+done
+[ -z "$NOT_REBUILT" ] || require "这些库仍是 Homebrew 的二进制,不是 build_deps26.sh 的产物:${NOT_REBUILT}
+  先跑 make deps26;如果是闭包里新冒出来的库,把它加进 build_deps26.sh。"
 
 # ── 许可白名单 ─────────────────────────────────────────────────────
-# 上面的闭包是**自动展开**的,而 collect_sources.sh 里的 LGPL 清单是写死的。Homebrew
-# 哪天让 swtpm 多链一个 libtasn1、gnutls,它会被静默打进包里,却没有对应源码。
+# 上面的闭包是**自动展开**的,而源码交付清单(build_deps26.sh 的 SOURCES)是写死的。
+# 哪天 QEMU 或 swtpm 多链一个 libtasn1、gnutls,它会被静默打进包里,却没有对应源码。
 # 所以每个进包的 dylib 都必须在这里归过类,没归类的直接失败。
-#   LGPL:必须同时出现在 collect_sources.sh 的 LGPL_SPECS 里(那边会核对版本)
-#   宽松许可(MIT / BSD / Apache):不要求交付源码,Open Source Notices 里列出即可
+#   全部:必须由 build_deps26.sh 编出来(上一段已核对),它的 tarball 随源码交付包发布
+#   LGPL:源码交付是义务;宽松许可(MIT / BSD / Apache):还要在 Open Source Notices 里列出
 for lib in "${FRAMEWORKS}"/*.dylib; do
     case "$(basename "$lib")" in
         libglib-2.0.*|libgio-2.0.*|libgmodule-2.0.*|libgobject-2.0.*) ;;  # LGPL-2.1+ → glib
@@ -150,8 +181,8 @@ for lib in "${FRAMEWORKS}"/*.dylib; do
         libslirp.*|libpcre2-8.*|libtpms.*|libswtpm_libtpms.*) ;;          # BSD
         libcrypto.*) ;;                                                   # Apache-2.0 (OpenSSL)
         *)
-            die "$(basename "$lib") 不在许可白名单里。先查清它的许可:LGPL/GPL 的要加进
-  collect_sources.sh 的 LGPL_SPECS 并交付源码,宽松许可的加进 Open Source Notices;
+            die "$(basename "$lib") 不在许可白名单里。先查清它的许可,把它加进 build_deps26.sh
+  (SOURCES 里写明许可,collect_sources.sh 会据此交付源码),并在 Open Source Notices 里列出;
   然后在 stage_helpers.sh 的白名单里给它归类。"
             ;;
     esac
@@ -219,7 +250,7 @@ cp "${FIRMWARE_DIR}/secboot-vars.fd" "${DATA}/secboot-vars.fd"
 if [ -f "$VIRTIO_WIN_ISO" ]; then
     MOUNT="$(hdiutil attach -readonly -nobrowse -plist "$VIRTIO_WIN_ISO" \
         | /usr/bin/python3 -c 'import plistlib,sys; d=plistlib.loads(sys.stdin.buffer.read()); print([e["mount-point"] for e in d["system-entities"] if "mount-point" in e][0])')"
-    trap 'hdiutil detach "$MOUNT" >/dev/null 2>&1 || true; rm -f "$QUEUE_FILE" "$SEEN_FILE"' EXIT
+    trap 'hdiutil detach "$MOUNT" >/dev/null 2>&1 || true; rm -f "$QUEUE_FILE" "$SEEN_FILE" "$REPLACED_FILE"' EXIT
     # **三个驱动摊平放在同一层,不分子目录。这是有意的,别改回去。**
     #
     # Windows 在 OOBE 的联网页提供「安装驱动程序」按钮,弹出的是一个文件夹选择器。
@@ -564,7 +595,8 @@ if [ -n "$DECLARED" ]; then
     HIGHER="$(printf '%s\n%s\n' "$DECLARED" "$REQUIRED" | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)"
     if [ "$HIGHER" != "$DECLARED" ] && [ "$REQUIRED" != "$DECLARED" ]; then
         require "随包二进制要求 macOS ${REQUIRED},但 Info.plist 声明 Windows 只要 ${DECLARED}。
-  老系统上用户能建 Windows 却起不来。先跑 make deps26(scripts/qemu/build_deps26.sh):把这些库按 26.0 部署目标重编;
+  老系统上用户能建 Windows 却起不来。先跑 make deps26(scripts/qemu/build_deps26.sh):把这些库按 26.0 部署目标重编,
+  闭包里的新库也要加进那个脚本;
   不行再考虑把 KyvenzaWindowsMinimumSystemVersion 调到 ${REQUIRED},
   并同步官网与 App Store 上的系统要求说明。"
     fi

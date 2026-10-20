@@ -14,9 +14,10 @@
 #   义务  QEMU(GPLv2)、SPICE vd_agent(GPLv2+,随驱动光盘进客体)、
 #         glib 系(LGPL-2.1+:glib/gobject/gio/gmodule)、
 #         json-glib(LGPL-2.1+)、gettext 的 libintl(LGPL-2.1+)
-#   好意  pixman(MIT)、libslirp / PCRE2 / libtpms / swtpm(BSD)、OpenSSL(Apache-2.0)、
-#         edk2(BSD-2-Clause-Patent)、virtio-win 驱动(BSD-3)
-#         —— 这些许可不要求我们提供源码,声明里给出上游地址即可,不收进包里。
+#   好意  pixman(MIT)、libslirp / PCRE2 / libtpms / swtpm(BSD)、OpenSSL(Apache-2.0)
+#         —— 许可不要求交付源码。但随包的这些全是 build_deps26.sh 从固定 tarball 编的,
+#         交付包里已经有那个脚本,不给它的输入就复现不出我们发的字节,所以一并放进 permissive/。
+#   不收  edk2(BSD-2-Clause-Patent,构建脚本已附)、virtio-win 驱动(BSD-3,上游二进制)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -39,22 +40,17 @@ QEMU_SHA256="$(read_default "${DIR}/build_qemu.sh" QEMU_SHA256)"
 VDAGENT_VERSION="$(read_default "${ROOT}/scripts/guest-tools/build_vdagent.sh" VDAGENT_VER)"
 VDAGENT_SHA256="$(read_default "${ROOT}/scripts/guest-tools/build_vdagent.sh" VDAGENT_SHA)"
 
-# LGPL 组件。版本必须与随包 dylib 实际构建自的版本一致 —— 我们用的是 Homebrew 的
-# 二进制,所以这里的版本、URL、sha256 全部取自对应 formula 的 stable 段
-# (`brew info --json=v2 <formula>`)。**升级 Homebrew 依赖后必须回来更新这三行**,
-# 否则交付的源码对不上实际分发的二进制,义务没有履行。
+# 随包的 dylib 与 swtpm 全部是 build_deps26.sh 按 macOS 26.0 部署目标从固定 tarball 编的
+# (Homebrew 只给最新系统出 bottle,在 macOS 27 上新装/升级后都会变成要求 27.0)。
+# 版本、URL、sha256 与许可只在那个脚本里写一份,这里用 `--print-sources` 读出来。
 #
-# **glib 不在这张表里**:它随包的那份是 build_deps26.sh 按 macOS 26.0 部署目标从源码重编的
-# (Homebrew 只给最新系统出 bottle,在 macOS 27 上升级后会变成要求 27.0),版本与 sha256
-# 钉在那个脚本里,下面单独处理。
-#
-# 以前「必须回来更新」只靠人记得:2026-09-20 Homebrew 把 glib 升到 2.90.0,
-# 9-23 打的 MAS 3.0.2 就带着 2.90.0 出去了,而这里还写着 2.88.3。现在下面会逐个
-# 比对 Homebrew 实际装的版本,不一致直接失败。
-LGPL_SPECS="
-json-glib|1.10.8|https://download.gnome.org/sources/json-glib/1.10/json-glib-1.10.8.tar.xz|55c5c141a564245b8f8fbe7698663c87a45a7333c2a2c56f06f811ab73b212dd
-gettext|1.0|https://ftpmirror.gnu.org/gnu/gettext/gettext-1.0.tar.gz|85d99b79c981a404874c02e0342176cf75c7698e2b51fe41031cf6526d974f1a
-"
+# 以前 json-glib / gettext 用的是 Homebrew 的二进制,这里另抄一份版本,靠逐个比对 Homebrew
+# 实际装的版本来防漂移:2026-09-20 Homebrew 把 glib 升到 2.90.0,9-23 打的 MAS 3.0.2 就带着
+# 2.90.0 出去了,而这里还写着 2.88.3。现在随包的不再取自 Homebrew,对应关系改由下面核对
+# 重编产物的戳来保证。
+DEPS26_SCRIPT="${DIR}/build_deps26.sh"
+DEPS26_SOURCES="$(bash "$DEPS26_SCRIPT" --print-sources)"
+DEPS26_STAMP="${ROOT}/.local/qemu/deps26/build.stamp"
 
 die() { echo "collect_sources: $*" >&2; exit 1; }
 
@@ -103,7 +99,7 @@ fetch() {
 }
 
 rm -rf "$OUT"
-mkdir -p "${OUT}/qemu" "${OUT}/scripts" "${OUT}/lgpl" "${OUT}/vdagent"
+mkdir -p "${OUT}/qemu" "${OUT}/scripts" "${OUT}/lgpl" "${OUT}/permissive" "${OUT}/vdagent"
 
 # ── QEMU:我们分发的那份二进制的完整对应源码 ──────────────────────
 echo "==> QEMU ${QEMU_VERSION}"
@@ -181,47 +177,30 @@ if [ -d "${DIR}/assets" ]; then
     echo "    assets/ ($(ls -1 "${DIR}/assets" | wc -l | tr -d ' ') 个文件)"
 fi
 
-# ── LGPL 组件 ──────────────────────────────────────────────────────
-# json-glib 与 gettext 随包的是 Homebrew 构建的 dylib,所以"对应源码"= 上游 tarball + Homebrew
-# formula(里面写着构建参数)。只给上游 tarball 是不够的 —— formula 才是我们这份二进制的
-# 实际构建方式。glib 另有专段,见下。
-echo "==> LGPL 组件"
-echo "$LGPL_SPECS" | while IFS='|' read -r name version url sha; do
+# ── build_deps26.sh 编的库(LGPL 与宽松许可)──────────────────────
+# 随包的 dylib 与 swtpm 不是 Homebrew 的二进制,而是 build_deps26.sh 用下面这些上游 tarball
+# 编的,所以"对应源码"= 这些 tarball + build_deps26.sh(已随脚本一起交付)。
+# 核对重编产物的戳,防止交付的源码与实际打进包里的不是同一个版本。
+echo "==> build_deps26.sh 的依赖库"
+[ -f "$DEPS26_STAMP" ] || die "没有 ${DEPS26_STAMP}:先跑 make deps26 并重新组包,随包的库才是这份源码对应的那些"
+echo "$DEPS26_SOURCES" | while IFS='|' read -r name version url sha license file; do
     [ -n "$name" ] || continue
-    echo "  ${name} ${version}"
-    # 随包的 dylib 就是 Homebrew 此刻装着的那份(stage_helpers.sh 从这里拷)。
-    # keg 目录名形如 2.90.0 或 2.90.0_1,下划线后是 formula 修订号,上游源码相同。
-    KEG="$(realpath "/opt/homebrew/opt/${name}" 2>/dev/null)" || die "Homebrew 里没装 ${name}"
-    INSTALLED="$(basename "$KEG")"
-    INSTALLED="${INSTALLED%%_*}"
-    [ "$INSTALLED" = "$version" ] || die "${name}: Homebrew 装的是 ${INSTALLED},这里写的是 ${version}。
-  随包 dylib 来自 Homebrew,交付的源码必须与之对应。按下面的输出更新 LGPL_SPECS 那一行:
-  brew info --json=v2 ${name} | python3 -c \"import json,sys;u=json.load(sys.stdin)['formulae'][0]['urls']['stable'];print(u['url'],u['checksum'])\""
-    fetch "$url" "${OUT}/lgpl/$(basename "$url")" "$sha"
-    FORMULA="${KEG}/.brew/${name}.rb"
-    [ -f "$FORMULA" ] || die "找不到 ${FORMULA}:formula 是这份二进制的实际构建方式,缺了就不是完整对应源码"
-    cp "$FORMULA" "${OUT}/lgpl/${name}.rb"
-    echo "    formula ${name}.rb"
-done
-
-# ── glib:build_deps26.sh 重编的那份 ────────────────────────────────
-# 随包的 libglib/libgobject/libgmodule/libgio 不是 Homebrew 的二进制,而是 build_deps26.sh
-# 用下面这份上游 tarball 按 macOS 26.0 部署目标编的,所以"对应源码"= 这份 tarball +
-# build_deps26.sh(已随脚本一起交付)。不再有 Homebrew formula 与它的补丁。
-# 版本与 sha256 从 build_deps26.sh 读,和构建脚本是同一个数;并核对重编产物的戳,
-# 防止交付的源码与实际打进包里的 glib 不是同一个版本。
-echo "  glib(build_deps26.sh)"
-DEPS26_SCRIPT="${DIR}/build_deps26.sh"
-GLIB_VERSION="$(read_default "$DEPS26_SCRIPT" GLIB_VERSION)"
-GLIB_SHA256="$(read_default "$DEPS26_SCRIPT" GLIB_SHA256)"
-GLIB_SERIES="${GLIB_VERSION%.*}"
-GLIB_URL="https://download.gnome.org/sources/glib/${GLIB_SERIES}/glib-${GLIB_VERSION}.tar.xz"
-DEPS26_STAMP="${ROOT}/.local/qemu/deps26/build.stamp"
-[ -f "$DEPS26_STAMP" ] || die "没有 ${DEPS26_STAMP}:先跑 make deps26 并重新组包,随包的 glib 才是这份源码对应的那个"
-grep -q "glib=${GLIB_VERSION} " "$DEPS26_STAMP" || die "deps26 产物的戳里 glib 不是 ${GLIB_VERSION}:${DEPS26_STAMP}
+    grep -q " ${name}=${version} " "$DEPS26_STAMP" || die "deps26 产物的戳里 ${name} 不是 ${version}:${DEPS26_STAMP}
   先 FORCE=1 make deps26 并重新组包"
-echo "    ${GLIB_VERSION}"
-fetch "$GLIB_URL" "${OUT}/lgpl/$(basename "$GLIB_URL")" "$GLIB_SHA256"
+    case "$license" in
+        LGPL-*|GPL-*) sub=lgpl ;;
+        *) sub=permissive ;;
+    esac
+    echo "  ${name} ${version}(${license})"
+    LOCAL_TARBALL="${ROOT}/.local/qemu/deps26-src/${file}"
+    if [ -f "$LOCAL_TARBALL" ] && [ "$(shasum -a 256 "$LOCAL_TARBALL" | awk '{print $1}')" = "$sha" ]; then
+        # 本地构建用的就是这一份,直接复用(哈希已复核)
+        cp "$LOCAL_TARBALL" "${OUT}/${sub}/${file}"
+        echo "    复用本地 tarball"
+    else
+        fetch "$url" "${OUT}/${sub}/${file}" "$sha"
+    fi
+done
 
 cp "${ROOT}/docs/oss-sources-README.md" "${OUT}/README.md"
 

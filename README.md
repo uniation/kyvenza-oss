@@ -3,14 +3,6 @@
 Build recipes and patches for the open source components that
 [Kyvenza](https://kyvenza.com) distributes inside its application bundle.
 
-**Website:** [kyvenza.com](https://kyvenza.com) ·
-**Docs:** [kyvenza.com/docs](https://kyvenza.com/docs/) ·
-**Release notes:** [kyvenza.com/releases](https://kyvenza.com/releases) ·
-**Open source notice:** [kyvenza.com/open-source](https://kyvenza.com/open-source/)
-
-Kyvenza is a native virtual machine manager for Apple Silicon Macs. This
-repository only covers the third-party open source parts of it.
-
 ## What this repository is
 
 Kyvenza is a commercial, closed-source virtual machine app for Apple Silicon.
@@ -34,8 +26,8 @@ archives are published per release, at:
 https://download.kyvenza.com/source/<version>/
 ```
 
-Each directory contains the exact QEMU release we built, the LGPL library
-sources, the build recipes we used (our scripts for GLib, Homebrew formulae for the rest), these scripts, and a
+Each directory contains the exact QEMU release we built, the sources of every
+library bundled next to it (all built by `scripts/build_deps26.sh`), these scripts, and a
 `SHA256SUMS` covering everything. The `releases/` directory in this repository
 keeps a git-tracked copy of each release's `SHA256SUMS`, so the delivered bytes
 can be checked against a record we cannot quietly rewrite.
@@ -80,7 +72,7 @@ codesign --force --deep --sign - /Applications/Kyvenza.app
 
 The same works for the LGPL dylibs in `Contents/Frameworks/`; their install
 names are rewritten to `@loader_path`, so a replacement is picked up with no
-further changes. This applies to copies downloaded from [kyvenza.com](https://kyvenza.com). Mac App
+further changes. This applies to copies downloaded from kyvenza.com. Mac App
 Store builds are re-signed by Apple and validated against a receipt, so a
 modified bundle will not launch as a Mac App Store app.
 
@@ -98,8 +90,6 @@ issue or write to support@kyvenza.com — incomplete compliance is a bug and we
 want to fix it.
 
 ---
-
-Product site: [kyvenza.com](https://kyvenza.com)
 
 © Uniation Software Co., Ltd. The scripts in this repository are published to
 satisfy our obligations under the GPL and LGPL. The components they build are
