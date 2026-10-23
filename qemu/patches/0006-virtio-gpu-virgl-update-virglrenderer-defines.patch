@@ -1,0 +1,78 @@
+From: Joelle van Dyne <j@getutm.app>
+Date: Sun, 30 Nov 2025 00:07:02 -0800
+Subject: [PATCH] virtio-gpu-virgl: update virglrenderer defines
+
+In order to support additional native texture types, we need to update the
+defines in virglrenderer. The changes are backwards compatible and so
+builds should work with either the new version or the old version.
+
+https://gitlab.freedesktop.org/virgl/virglrenderer/-/merge_requests/1583
+
+Signed-off-by: Joelle van Dyne <j@getutm.app>
+
+(cherry picked from utmapp/qemu commit 4e68da6539; ui/console API renamed for 11.1)
+---
+ hw/display/virtio-gpu-virgl.c | 27 +++++++++++++++++++++++++--
+ 1 file changed, 25 insertions(+), 2 deletions(-)
+
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index 64d1b8edf56..5d5a99827f3 100644
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -44,6 +44,8 @@
+ #define VIRGL_HAS_MAP_FIXED \
+     (VIRGL_CHECK_VERSION(1, 3, 0) && !IS_ENABLED(CONFIG_WIN32))
+ 
++#define NATIVE_HANDLE_SUPPORT_VERSION (1)
++
+ struct virtio_gpu_virgl_resource {
+     struct virtio_gpu_simple_resource base;
+     MemoryRegion *mr;
+@@ -569,12 +571,28 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
+         memset(&ext, 0, sizeof(ext));
+         ret = virgl_renderer_resource_get_info_ext(ss.resource_id, &ext);
+         info = ext.base;
++        /* fallback to older version */
+         native = (ScanoutTextureNative){
+             .type = ext.d3d_tex2d ? SCANOUT_TEXTURE_NATIVE_TYPE_D3D :
+                                     SCANOUT_TEXTURE_NATIVE_TYPE_NONE,
+             .handle = ext.d3d_tex2d,
+         };
+-#else
++#if VIRGL_RENDERER_RESOURCE_INFO_EXT_VERSION >= NATIVE_HANDLE_SUPPORT_VERSION
++        if (ext.version >= VIRGL_RENDERER_RESOURCE_INFO_EXT_VERSION) {
++            switch (ext.native_type) {
++            case VIRGL_NATIVE_HANDLE_NONE:
++            case VIRGL_NATIVE_HANDLE_D3D_TEX2D: {
++                /* already handled above */
++                break;
++            }
++            default: {
++                /* ignore unsupported hint texture type */
++                break;
++            }
++            }
++        }
++#endif
++#else /* VIRGL_VERSION_MAJOR < 1 */
+         memset(&info, 0, sizeof(info));
+         ret = virgl_renderer_resource_get_info(ss.resource_id, &info);
+ #endif
+@@ -1453,11 +1471,16 @@ static int virtio_gpu_virgl_init(VirtIOGPU *g)
+ #endif
+     }
+ #endif
++#if defined(VIRGL_RENDERER_NATIVE_SHARE_TEXTURE) && defined(CONFIG_DARWIN)
++    if (qemu_egl_angle_native_device) {
++        flags |= VIRGL_RENDERER_NATIVE_SHARE_TEXTURE;
++    }
++#endif
+ #ifdef VIRGL_RENDERER_D3D11_SHARE_TEXTURE
+     if (qemu_egl_angle_d3d) {
+         flags |= VIRGL_RENDERER_D3D11_SHARE_TEXTURE;
+-    }
+ #endif
++    }
+ #if VIRGL_VERSION_MAJOR >= 1
+     if (virtio_gpu_venus_enabled(g->parent_obj.conf)) {
+         flags |= VIRGL_RENDERER_VENUS | VIRGL_RENDERER_RENDER_SERVER;

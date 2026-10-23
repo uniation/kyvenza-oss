@@ -1,0 +1,146 @@
+From: Kyvenza <support@kyvenza.com>
+Date: Mon, 19 Oct 2026 14:11:03 +0800
+Subject: [PATCH] ui/egl-helpers: initialise ANGLE's Metal backend on macOS
+
+egl_init() had no macOS branch, so -display dbus,gl=on could not create a
+GL context there. Add one that opens ANGLE's EGL display, explicitly asking
+for the Metal backend (ANGLE picks its OpenGL backend by default on macOS,
+and native Metal scanouts as well as EGL_ANGLE_device_metal only exist on the
+Metal one), and record the MTLDevice ANGLE runs on in
+qemu_egl_angle_native_device so the scanout code can share it.
+---
+ include/ui/egl-helpers.h |  6 ++++
+ ui/egl-helpers.c         | 68 ++++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 72 insertions(+), 2 deletions(-)
+
+diff --git a/include/ui/egl-helpers.h b/include/ui/egl-helpers.h
+index 405ddd91259..9ec0e82b726 100644
+--- a/include/ui/egl-helpers.h
++++ b/include/ui/egl-helpers.h
+@@ -11,6 +11,8 @@
+ 
+ extern EGLDisplay *qemu_egl_display;
+ extern EGLConfig qemu_egl_config;
++/* Host GPU device behind ANGLE (MTLDevice on macOS), NULL when unknown. */
++extern void *qemu_egl_angle_native_device;
+ extern DisplayGLMode qemu_egl_mode;
+ extern bool qemu_egl_angle_d3d;
+ 
+@@ -77,6 +79,10 @@ int qemu_egl_init_dpy_mesa(EGLNativeDisplayType dpy, DisplayGLMode mode);
+ int qemu_egl_init_dpy_win32(EGLNativeDisplayType dpy, DisplayGLMode mode);
+ #endif
+ 
++#ifdef CONFIG_DARWIN
++int qemu_egl_init_dpy_darwin(void);
++#endif
++
+ EGLContext qemu_egl_init_ctx(void);
+ bool qemu_egl_has_dmabuf(void);
+ 
+diff --git a/ui/egl-helpers.c b/ui/egl-helpers.c
+index d689f187c4e..b128702977a 100644
+--- a/ui/egl-helpers.c
++++ b/ui/egl-helpers.c
+@@ -27,6 +27,7 @@
+ 
+ EGLDisplay *qemu_egl_display;
+ EGLConfig qemu_egl_config;
++void *qemu_egl_angle_native_device;
+ DisplayGLMode qemu_egl_mode;
+ bool qemu_egl_angle_d3d;
+ 
+@@ -490,7 +491,7 @@ EGLSurface qemu_egl_init_surface_x11(EGLContext ectx, EGLNativeWindowType win)
+ 
+ /* ---------------------------------------------------------------------- */
+ 
+-#if defined(CONFIG_X11) || defined(CONFIG_GBM) || defined(WIN32)
++#if defined(CONFIG_X11) || defined(CONFIG_GBM) || defined(WIN32) || defined(CONFIG_DARWIN)
+ 
+ /*
+  * Taken from glamor_egl.h from the Xorg xserver, which is MIT licensed
+@@ -528,7 +529,23 @@ EGLDisplay qemu_egl_get_display(EGLNativeDisplayType native,
+     /* In practise any EGL 1.5 implementation would support the EXT extension */
+     if (epoxy_has_egl_extension(NULL, "EGL_EXT_platform_base")) {
+         if (platform != 0) {
+-            dpy = eglGetPlatformDisplayEXT(platform, native, NULL);
++            const EGLint *attribs = NULL;
++#if defined(EGL_PLATFORM_ANGLE_ANGLE) && defined(EGL_PLATFORM_ANGLE_TYPE_METAL_ANGLE)
++            /*
++             * ANGLE picks its OpenGL backend by default on macOS. Native
++             * scanouts need the Metal one, which is also where
++             * EGL_ANGLE_device_metal comes from.
++             */
++            static const EGLint angle_metal[] = {
++                EGL_PLATFORM_ANGLE_TYPE_ANGLE, EGL_PLATFORM_ANGLE_TYPE_METAL_ANGLE,
++                EGL_NONE,
++            };
++            if (platform == EGL_PLATFORM_ANGLE_ANGLE) {
++                attribs = angle_metal;
++            }
++#endif
++            dpy = eglGetPlatformDisplayEXT(platform, (void *)(uintptr_t)native,
++                                           attribs);
+         }
+     }
+ 
+@@ -621,6 +638,36 @@ int qemu_egl_init_dpy_mesa(EGLNativeDisplayType dpy, DisplayGLMode mode)
+ #endif
+ 
+ 
++#ifdef CONFIG_DARWIN
++int qemu_egl_init_dpy_darwin(void)
++{
++    EGLenum platform = 0;
++
++#ifdef EGL_PLATFORM_ANGLE_ANGLE
++    platform = EGL_PLATFORM_ANGLE_ANGLE;
++#endif
++    /* ANGLE on Metal provides GLES only */
++    if (qemu_egl_init_dpy(EGL_DEFAULT_DISPLAY, platform, DISPLAY_GL_MODE_ES) < 0) {
++        return -1;
++    }
++
++#ifdef EGL_METAL_DEVICE_ANGLE
++    if (epoxy_has_egl_extension(qemu_egl_display, "EGL_EXT_device_query")) {
++        EGLDeviceEXT device;
++        void *metal_device;
++
++        if (eglQueryDisplayAttribEXT(qemu_egl_display, EGL_DEVICE_EXT,
++                                     (EGLAttrib *)&device) &&
++            eglQueryDeviceAttribEXT(device, EGL_METAL_DEVICE_ANGLE,
++                                    (EGLAttrib *)&metal_device)) {
++            qemu_egl_angle_native_device = metal_device;
++        }
++    }
++#endif
++    return 0;
++}
++#endif
++
+ #ifdef WIN32
+ int qemu_egl_init_dpy_win32(EGLNativeDisplayType dpy, DisplayGLMode mode)
+ {
+@@ -718,6 +765,23 @@ bool egl_init(const char *rendernode, DisplayGLMode mode, Error **errp)
+         error_setg(errp, "egl: egl_init_ctx failed");
+         return false;
+     }
++#elif defined(CONFIG_DARWIN)
++    if (qemu_egl_init_dpy_darwin() < 0) {
++        error_setg(errp, "egl: ANGLE init failed");
++        return false;
++    }
++    qemu_egl_rn_ctx = qemu_egl_init_ctx();
++    if (!qemu_egl_rn_ctx) {
++        error_setg(errp, "egl: egl_init_ctx failed");
++        return false;
++    }
++    /*
++     * Without a current EGL context libepoxy on macOS dispatches GL calls to
++     * the system OpenGL framework, not ANGLE. The caller keeps the main loop
++     * on this thread (see early_dbus_init).
++     */
++    eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
++                   qemu_egl_rn_ctx);
+ #elif defined(CONFIG_GBM)
+     if (egl_rendernode_init(rendernode, mode) < 0) {
+         error_setg(errp, "egl: render node init failed");

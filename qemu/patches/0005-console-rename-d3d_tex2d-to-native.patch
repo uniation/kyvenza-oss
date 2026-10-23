@@ -1,0 +1,335 @@
+From: Joelle van Dyne <j@getutm.app>
+Date: Sat, 3 Jan 2026 14:32:15 -0800
+Subject: [PATCH] console: rename `d3d_tex2d` to `native`
+
+In order to support native texture scanout beyond D3D, we make this more
+generic allowing for multiple native texture handle types.
+
+Signed-off-by: Joelle van Dyne <j@getutm.app>
+
+(cherry picked from utmapp/qemu commit 3efe3a5992; ui/console API renamed for 11.1, callback members keep their names)
+---
+ hw/display/virtio-gpu-virgl.c | 10 +++++++---
+ include/ui/console.h          | 24 +++++++++++++++++++-----
+ include/ui/gtk.h              |  4 ++--
+ include/ui/sdl2.h             |  2 +-
+ ui/console.c                  |  8 ++++----
+ ui/dbus-console.c             |  2 +-
+ ui/dbus-listener.c            |  8 ++++----
+ ui/egl-headless.c             |  4 ++--
+ ui/gtk-egl.c                  |  4 ++--
+ ui/gtk-gl-area.c              |  4 ++--
+ ui/sdl2-gl.c                  |  2 +-
+ ui/spice-display.c            |  2 +-
+ 12 files changed, 46 insertions(+), 28 deletions(-)
+
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index 6e298f997d6..64d1b8edf56 100644
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -562,14 +562,18 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
+ 
+     if (ss.resource_id) {
+         struct virgl_renderer_resource_info info;
+-        void *d3d_tex2d = NULL;
++        ScanoutTextureNative native = NO_NATIVE_TEXTURE;
+ 
+ #if VIRGL_VERSION_MAJOR >= 1
+         struct virgl_renderer_resource_info_ext ext;
+         memset(&ext, 0, sizeof(ext));
+         ret = virgl_renderer_resource_get_info_ext(ss.resource_id, &ext);
+         info = ext.base;
+-        d3d_tex2d = ext.d3d_tex2d;
++        native = (ScanoutTextureNative){
++            .type = ext.d3d_tex2d ? SCANOUT_TEXTURE_NATIVE_TYPE_D3D :
++                                    SCANOUT_TEXTURE_NATIVE_TYPE_NONE,
++            .handle = ext.d3d_tex2d,
++        };
+ #else
+         memset(&info, 0, sizeof(info));
+         ret = virgl_renderer_resource_get_info(ss.resource_id, &info);
+@@ -594,7 +598,7 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
+             info.flags & VIRTIO_GPU_RESOURCE_FLAG_Y_0_TOP,
+             info.width, info.height,
+             ss.r.x, ss.r.y, ss.r.width, ss.r.height,
+-            d3d_tex2d);
++            native);
+     } else {
+         qemu_console_set_surface(g->parent_obj.scanout[ss.scanout_id].con, NULL);
+         qemu_console_gl_scanout_disable(g->parent_obj.scanout[ss.scanout_id].con);
+diff --git a/include/ui/console.h b/include/ui/console.h
+index 29bf7228883..a1f42b5a458 100644
+--- a/include/ui/console.h
++++ b/include/ui/console.h
+@@ -93,6 +93,20 @@ struct QemuConsoleClass {
+     char * (*get_label)(const QemuConsole *con);
+ };
+ 
++typedef enum ScanoutTextureNativeType {
++    SCANOUT_TEXTURE_NATIVE_TYPE_NONE,
++    SCANOUT_TEXTURE_NATIVE_TYPE_D3D,
++} ScanoutTextureNativeType;
++
++typedef struct ScanoutTextureNative {
++    ScanoutTextureNativeType type;
++    void *handle;
++} ScanoutTextureNative;
++
++#define NO_NATIVE_TEXTURE ((ScanoutTextureNative){ \
++    .type = SCANOUT_TEXTURE_NATIVE_TYPE_NONE \
++})
++
+ typedef struct ScanoutTexture {
+     uint32_t backing_id;
+     bool backing_y_0_top;
+@@ -102,7 +116,7 @@ typedef struct ScanoutTexture {
+     uint32_t y;
+     uint32_t width;
+     uint32_t height;
+-    void *d3d_tex2d;
++    ScanoutTextureNative native;
+ } ScanoutTexture;
+ 
+ typedef struct QemuUIInfo {
+@@ -207,8 +221,8 @@ typedef struct DisplayChangeListenerOps {
+                                    uint32_t backing_height,
+                                    uint32_t x, uint32_t y,
+                                    uint32_t w, uint32_t h,
+-                                   void *d3d_tex2d);
+-    /* optional (default to true if has dpy_gl_scanout_dmabuf) */
++                                   ScanoutTextureNative native);
++    /* optional (default to true if has qemu_console_gl_scanout_dmabuf) */
+     bool (*dpy_has_dmabuf)(DisplayChangeListener *dcl);
+     /* optional */
+     void (*dpy_gl_scanout_dmabuf)(DisplayChangeListener *dcl,
+@@ -293,7 +307,7 @@ void qemu_console_gl_scanout_texture(QemuConsole *con,
+                                      uint32_t backing_id, bool backing_y_0_top,
+                                      uint32_t backing_width, uint32_t backing_height,
+                                      uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+-                                     void *d3d_tex2d);
++                                     ScanoutTextureNative native);
+ void qemu_console_gl_scanout_dmabuf(QemuConsole *con,
+                                     QemuDmaBuf *dmabuf);
+ void qemu_console_gl_cursor_dmabuf(QemuConsole *con, QemuDmaBuf *dmabuf,
+@@ -325,7 +339,7 @@ typedef struct GraphicHwOps {
+     void (*invalidate)(void *opaque);
+     /*
+      * Returns true if the update is handled synchronously, false if deferred
+-     * and graphic_hw_update_done() will be called when ready (to resume waiting
++     * and qemu_console_hw_update_done() will be called when ready (to resume waiting
+      * tasks/coroutines).
+      * Optional.
+      */
+diff --git a/include/ui/gtk.h b/include/ui/gtk.h
+index 5c9c34a069e..a68409bc875 100644
+--- a/include/ui/gtk.h
++++ b/include/ui/gtk.h
+@@ -180,7 +180,7 @@ void gd_egl_scanout_texture(DisplayChangeListener *dcl,
+                             uint32_t backing_height,
+                             uint32_t x, uint32_t y,
+                             uint32_t w, uint32_t h,
+-                            void *d3d_tex2d);
++                            ScanoutTextureNative native);
+ void gd_egl_scanout_dmabuf(DisplayChangeListener *dcl,
+                            QemuDmaBuf *dmabuf);
+ void gd_egl_cursor_dmabuf(DisplayChangeListener *dcl,
+@@ -217,7 +217,7 @@ void gd_gl_area_scanout_texture(DisplayChangeListener *dcl,
+                                 uint32_t backing_height,
+                                 uint32_t x, uint32_t y,
+                                 uint32_t w, uint32_t h,
+-                                void *d3d_tex2d);
++                                ScanoutTextureNative native);
+ void gd_gl_area_scanout_disable(DisplayChangeListener *dcl);
+ void gd_gl_area_scanout_flush(DisplayChangeListener *dcl,
+                               uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+diff --git a/include/ui/sdl2.h b/include/ui/sdl2.h
+index 9daf5ecffae..13467fd5b33 100644
+--- a/include/ui/sdl2.h
++++ b/include/ui/sdl2.h
+@@ -94,7 +94,7 @@ void sdl2_gl_scanout_texture(DisplayChangeListener *dcl,
+                              uint32_t backing_height,
+                              uint32_t x, uint32_t y,
+                              uint32_t w, uint32_t h,
+-                             void *d3d_tex2d);
++                             ScanoutTextureNative native);
+ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
+                            uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+ void sdl2_gl_scanout_dmabuf(DisplayChangeListener *dcl,
+diff --git a/ui/console.c b/ui/console.c
+index a8a2a247d8f..91d64c78745 100644
+--- a/ui/console.c
++++ b/ui/console.c
+@@ -307,7 +307,7 @@ static void displaychangelistener_display_console(DisplayChangeListener *dcl,
+                                          con->scanout.texture.y,
+                                          con->scanout.texture.width,
+                                          con->scanout.texture.height,
+-                                         con->scanout.texture.d3d_tex2d);
++                                         con->scanout.texture.native);
+     }
+ }
+ 
+@@ -960,7 +960,7 @@ void qemu_console_gl_scanout_texture(QemuConsole *con,
+                                      uint32_t backing_height,
+                                      uint32_t x, uint32_t y,
+                                      uint32_t width, uint32_t height,
+-                                     void *d3d_tex2d)
++                                     ScanoutTextureNative native)
+ {
+     DisplayState *s = con->ds;
+     DisplayChangeListener *dcl;
+@@ -968,7 +968,7 @@ void qemu_console_gl_scanout_texture(QemuConsole *con,
+     con->scanout.kind = SCANOUT_TEXTURE;
+     con->scanout.texture = (ScanoutTexture) {
+         backing_id, backing_y_0_top, backing_width, backing_height,
+-        x, y, width, height, d3d_tex2d,
++        x, y, width, height, native,
+     };
+     QLIST_FOREACH(dcl, &s->listeners, next) {
+         if (con != dcl->con) {
+@@ -979,7 +979,7 @@ void qemu_console_gl_scanout_texture(QemuConsole *con,
+                                              backing_y_0_top,
+                                              backing_width, backing_height,
+                                              x, y, width, height,
+-                                             d3d_tex2d);
++                                             native);
+         }
+     }
+ }
+diff --git a/ui/dbus-console.c b/ui/dbus-console.c
+index e1ac06814ba..7c3d665c29f 100644
+--- a/ui/dbus-console.c
++++ b/ui/dbus-console.c
+@@ -101,7 +101,7 @@ dbus_gl_scanout_texture(DisplayChangeListener *dcl,
+                         uint32_t backing_height,
+                         uint32_t x, uint32_t y,
+                         uint32_t w, uint32_t h,
+-                        void *d3d_tex2d)
++                        ScanoutTextureNative native)
+ {
+     DBusDisplayConsole *ddc = container_of(dcl, DBusDisplayConsole, dcl);
+ 
+diff --git a/ui/dbus-listener.c b/ui/dbus-listener.c
+index 2e2f6ba4183..d524d5fc07f 100644
+--- a/ui/dbus-listener.c
++++ b/ui/dbus-listener.c
+@@ -587,7 +587,7 @@ static void dbus_scanout_texture(DisplayChangeListener *dcl,
+                                  uint32_t backing_height,
+                                  uint32_t x, uint32_t y,
+                                  uint32_t w, uint32_t h,
+-                                 void *d3d_tex2d)
++                                 ScanoutTextureNative native)
+ {
+     trace_dbus_scanout_texture(tex_id, backing_y_0_top,
+                                backing_width, backing_height, x, y, w, h);
+@@ -618,8 +618,8 @@ static void dbus_scanout_texture(DisplayChangeListener *dcl,
+     assert(surface_width(ddl->ds) == w);
+     assert(surface_height(ddl->ds) == h);
+ 
+-    if (d3d_tex2d) {
+-        dbus_scanout_share_d3d_texture(ddl, d3d_tex2d, backing_y_0_top,
++    if (native.type == SCANOUT_TEXTURE_NATIVE_TYPE_D3D) {
++        dbus_scanout_share_d3d_texture(ddl, native.handle, backing_y_0_top,
+                                        backing_width, backing_height, x, y, w, h);
+     } else {
+         dbus_scanout_map(ddl);
+@@ -868,7 +868,7 @@ static void dbus_gl_gfx_switch(DisplayChangeListener *dcl,
+ 
+         /* TODO: lazy send dmabuf (there are unnecessary sent otherwise) */
+         dbus_scanout_texture(&ddl->dcl, ddl->ds->texture, false,
+-                             width, height, 0, 0, width, height, NULL);
++                             width, height, 0, 0, width, height, NO_NATIVE_TEXTURE);
+     }
+ }
+ #endif
+diff --git a/ui/egl-headless.c b/ui/egl-headless.c
+index ba27efcf4c3..ba1734a3408 100644
+--- a/ui/egl-headless.c
++++ b/ui/egl-headless.c
+@@ -63,7 +63,7 @@ static void egl_scanout_texture(DisplayChangeListener *dcl,
+                                 uint32_t backing_height,
+                                 uint32_t x, uint32_t y,
+                                 uint32_t w, uint32_t h,
+-                                void *d3d_tex2d)
++                                ScanoutTextureNative native)
+ {
+     egl_dpy *edpy = container_of(dcl, egl_dpy, dcl);
+ 
+@@ -98,7 +98,7 @@ static void egl_scanout_dmabuf(DisplayChangeListener *dcl,
+     height = qemu_dmabuf_get_height(dmabuf);
+ 
+     egl_scanout_texture(dcl, texture, false, width, height, 0, 0,
+-                        width, height, NULL);
++                        width, height, NO_NATIVE_TEXTURE);
+ }
+ 
+ static void egl_cursor_dmabuf(DisplayChangeListener *dcl,
+diff --git a/ui/gtk-egl.c b/ui/gtk-egl.c
+index adc81f34b1c..c98706d257a 100644
+--- a/ui/gtk-egl.c
++++ b/ui/gtk-egl.c
+@@ -237,7 +237,7 @@ void gd_egl_scanout_texture(DisplayChangeListener *dcl,
+                             uint32_t backing_width, uint32_t backing_height,
+                             uint32_t x, uint32_t y,
+                             uint32_t w, uint32_t h,
+-                            void *d3d_tex2d)
++                            ScanoutTextureNative native)
+ {
+     VirtualConsole *vc = container_of(dcl, VirtualConsole, gfx.dcl);
+ 
+@@ -288,7 +288,7 @@ void gd_egl_scanout_dmabuf(DisplayChangeListener *dcl,
+     y0_top = qemu_dmabuf_get_y0_top(dmabuf);
+ 
+     gd_egl_scanout_texture(dcl, texture, y0_top, backing_width, backing_height,
+-                           x, y, width, height, NULL);
++                           x, y, width, height, NO_NATIVE_TEXTURE);
+ 
+     if (qemu_dmabuf_get_allow_fences(dmabuf)) {
+         vc->gfx.guest_fb.dmabuf = dmabuf;
+diff --git a/ui/gtk-gl-area.c b/ui/gtk-gl-area.c
+index 29497019ee4..58db9c14b7b 100644
+--- a/ui/gtk-gl-area.c
++++ b/ui/gtk-gl-area.c
+@@ -291,7 +291,7 @@ void gd_gl_area_scanout_texture(DisplayChangeListener *dcl,
+                                 uint32_t backing_height,
+                                 uint32_t x, uint32_t y,
+                                 uint32_t w, uint32_t h,
+-                                void *d3d_tex2d)
++                                ScanoutTextureNative native)
+ {
+     VirtualConsole *vc = container_of(dcl, VirtualConsole, gfx.dcl);
+ 
+@@ -358,7 +358,7 @@ void gd_gl_area_scanout_dmabuf(DisplayChangeListener *dcl,
+ 
+     gd_gl_area_scanout_texture(dcl, texture, y0_top,
+                                backing_width, backing_height,
+-                               x, y, width, height, NULL);
++                               x, y, width, height, NO_NATIVE_TEXTURE);
+ 
+     if (qemu_dmabuf_get_allow_fences(dmabuf)) {
+         vc->gfx.guest_fb.dmabuf = dmabuf;
+diff --git a/ui/sdl2-gl.c b/ui/sdl2-gl.c
+index 1547ad2f6f8..2767f5e6907 100644
+--- a/ui/sdl2-gl.c
++++ b/ui/sdl2-gl.c
+@@ -212,7 +212,7 @@ void sdl2_gl_scanout_texture(DisplayChangeListener *dcl,
+                              uint32_t backing_height,
+                              uint32_t x, uint32_t y,
+                              uint32_t w, uint32_t h,
+-                             void *d3d_tex2d)
++                             ScanoutTextureNative native)
+ {
+     struct sdl2_console *scon = container_of(dcl, struct sdl2_console, dcl);
+ 
+diff --git a/ui/spice-display.c b/ui/spice-display.c
+index 75c7df7bb5e..c861ef82e45 100644
+--- a/ui/spice-display.c
++++ b/ui/spice-display.c
+@@ -1078,7 +1078,7 @@ static void qemu_spice_gl_scanout_texture(DisplayChangeListener *dcl,
+                                           uint32_t backing_height,
+                                           uint32_t x, uint32_t y,
+                                           uint32_t w, uint32_t h,
+-                                          void *d3d_tex2d)
++                                          ScanoutTextureNative native)
+ {
+     SimpleSpiceDisplay *ssd = container_of(dcl, SimpleSpiceDisplay, dcl);
+     EGLint offset[DMABUF_MAX_PLANES], stride[DMABUF_MAX_PLANES], fourcc = 0;

@@ -1,0 +1,73 @@
+From: Kyvenza <support@kyvenza.com>
+Date: Mon, 19 Oct 2026 23:20:15 +0800
+Subject: [PATCH] hvf: arm: drop data-abort writes without ISV instead of
+ asserting
+
+A store without a valid instruction syndrome (STP, SIMD, SVE) to an
+address nothing decodes hit assert(isv) and took the VM down. Windows
+on a virtio-gpu with hostmem does this late in shutdown: it clears
+memory decoding on the device, which removes the 8 GiB hostmem BAR,
+and a user process then stores through a mapping of a blob it has not
+torn down yet (traced: BAR removed 0.7 ms before the first such store;
+166 of them in one shutdown, 3 aborts in a day of testing).
+
+Drop such writes and step over the instruction. That is what the
+emulated path already does for a write nothing decodes, and what the
+hardware does for a write to a disabled BAR. Injecting a synchronous
+external abort instead, as KVM does for KVM_EXIT_ARM_NISV, made that
+Windows shutdown hang, so it is only kept for reads, where there is no
+way to know the destination register.
+---
+ target/arm/hvf/hvf.c | 38 +++++++++++++++++++++++++++++++++++---
+ 1 file changed, 35 insertions(+), 3 deletions(-)
+
+diff --git a/target/arm/hvf/hvf.c b/target/arm/hvf/hvf.c
+index 6df4c221215..8d6767cfaf1 100644
+--- a/target/arm/hvf/hvf.c
++++ b/target/arm/hvf/hvf.c
+@@ -2467,10 +2467,42 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
+         assert(!s1ptw);
+ 
+         /*
+-         * TODO: ISV will be 0 for SIMD or SVE accesses.
+-         * Inject the exception into the guest.
++         * ISV is 0 for SIMD, SVE and load/store-pair accesses, so there is no
++         * register to emulate the MMIO access with. Don't take the whole VM
++         * down for it: Windows stores through a stale user mapping of an
++         * unmapped hostmem blob late in shutdown.
++         *
++         * A write is dropped, which is what the emulated path above does for
++         * a write nothing decodes. Injecting an external abort for it instead
++         * (what KVM does for KVM_EXIT_ARM_NISV) hung that Windows shutdown.
++         * A read needs a destination register we cannot know, so it still
++         * gets the external abort.
+          */
+-        assert(isv);
++        if (!isv && iswrite) {
++            /* no cpu_synchronize_state() here: advance_pc writes the vCPU PC directly */
++            qemu_log_mask(LOG_GUEST_ERROR,
++                          "hvf: dropping a write without ISV at IPA 0x%" PRIx64
++                          " (va 0x%" PRIx64 ")\n", ipa,
++                          (uint64_t)excp->virtual_address);
++            advance_pc = true;
++            break;
++        }
++        if (!isv) {
++            int target_el;
++
++            cpu_synchronize_state(cpu);
++            target_el = MAX(arm_current_el(env), 1);
++            qemu_log_mask(LOG_GUEST_ERROR,
++                          "hvf: data abort without ISV at IPA 0x%" PRIx64
++                          " (pc 0x%" PRIx64 "), injecting an external abort\n",
++                          ipa, env->pc);
++            env->exception.vaddress = excp->virtual_address;
++            hvf_raise_exception(cpu, EXCP_DATA_ABORT,
++                                syn_data_abort_no_iss(arm_current_el(env) == target_el,
++                                                      0, 1, 0, 0, iswrite, 0x10),
++                                target_el);
++            break;
++        }
+ 
+         /*
+          * Emulate MMIO.

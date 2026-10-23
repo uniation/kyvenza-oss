@@ -60,6 +60,12 @@ LIBTPMS_SHA256="edac03680f8a4a1c5c1d609a10e3f41e1a129e38ff5158f0c8deaedc719fb127
 SWTPM_VERSION="0.10.2"
 SWTPM_URL="https://github.com/stefanberger/swtpm/archive/refs/tags/v${SWTPM_VERSION}.tar.gz"
 SWTPM_SHA256="f61cf6f1e9bbcb4cefb30b70cafaf1c4df54c6961e65cfa63830e8ad0e220134"
+# 只有头文件,不随包任何二进制。QEMU 的 qemu-vdagent(剪贴板与拖放)编译时要它,以前一直
+# 靠构建机上碰巧装着的 Homebrew 版或 3d-spike 前缀,干净环境里 configure 直接失败。
+# sha256 与上游发布的 .sha256sum 一致。
+SPICE_PROTOCOL_VERSION="0.14.4"
+SPICE_PROTOCOL_URL="https://www.spice-space.org/download/releases/spice-protocol-${SPICE_PROTOCOL_VERSION}.tar.xz"
+SPICE_PROTOCOL_SHA256="04ffba610d9fd441cfc47dfaa135d70096e60b1046d2119d8db2f8ea0d17d912"
 
 # 源码清单:名字|版本|URL|sha256|许可|本地文件名。collect_sources.sh 只认这一份。
 # 本地文件名单列出来,是因为 GitHub 的 tag 归档 URL 末尾只有 v0.10.2.tar.gz,
@@ -74,6 +80,7 @@ libslirp|${LIBSLIRP_VERSION}|${LIBSLIRP_URL}|${LIBSLIRP_SHA256}|BSD-3-Clause|lib
 json-glib|${JSON_GLIB_VERSION}|${JSON_GLIB_URL}|${JSON_GLIB_SHA256}|LGPL-2.1-or-later|json-glib-${JSON_GLIB_VERSION}.tar.xz
 libtpms|${LIBTPMS_VERSION}|${LIBTPMS_URL}|${LIBTPMS_SHA256}|BSD-3-Clause|libtpms-${LIBTPMS_VERSION}.tar.gz
 swtpm|${SWTPM_VERSION}|${SWTPM_URL}|${SWTPM_SHA256}|BSD-3-Clause|swtpm-${SWTPM_VERSION}.tar.gz
+spice-protocol|${SPICE_PROTOCOL_VERSION}|${SPICE_PROTOCOL_URL}|${SPICE_PROTOCOL_SHA256}|BSD-3-Clause|spice-protocol-${SPICE_PROTOCOL_VERSION}.tar.xz
 "
 
 if [ "${1:-}" = "--print-sources" ]; then
@@ -281,6 +288,12 @@ tar -xf "${SRC}/swtpm-${SWTPM_VERSION}.tar.gz" -C "$WORK"
     || { tail -30 "${WORK}/swtpm-autoreconf.log" >&2; die "swtpm 的 autoreconf 失败"; }
 BUILD_SUBDIRS="include src/utils src/swtpm" configure_build "${WORK}/swtpm-${SWTPM_VERSION}" swtpm \
     --with-openssl --without-gnutls --without-cuse --without-selinux --disable-tests
+
+# 装到 share/pkgconfig 与 include/spice-1,build_qemu.sh 只把前者加进 PKG_CONFIG_PATH。
+echo "==> spice-protocol ${SPICE_PROTOCOL_VERSION}(只有头文件)"
+tar -xf "${SRC}/spice-protocol-${SPICE_PROTOCOL_VERSION}.tar.xz" -C "$WORK"
+meson_build "${WORK}/spice-protocol-${SPICE_PROTOCOL_VERSION}" spice-protocol
+[ -f "${PREFIX}/share/pkgconfig/spice-protocol.pc" ] || die "spice-protocol 没有装出 share/pkgconfig/spice-protocol.pc"
 
 echo "==> 校验产物"
 # 随包会用到的每一个产物。stage_helpers.sh 只会从这里取,少一个就是有个库还在用 Homebrew 的。

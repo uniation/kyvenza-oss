@@ -10,10 +10,20 @@
 # SPICE 和一堆调试便利;这份是**分发用的最小构建**。砍掉的每一项都对应一条理由,
 # 见下面的 configure 段落 —— 别为了"以后可能用得上"把它们加回来,每一个都是要
 # 随包分发、逐个签名、并承担其许可义务的动态库。
+#
+# 唯一一次有意加回来的是图形加速那一组(--enable-opengl / virglrenderer / gio /
+# dbus-display,2026-10-20 门 1 通过后)。理由是实测而不是"可能用得上":3D 通路在
+# 桌面合成、Edge、Office、视频四个场景上都明显好于 viogpudo + VNC,而 VNC 通路有
+# 约 16 fps 的天花板,换不掉。依赖由 build_gfx.sh 构建,数据见
+# docs/2026-10-19-windows-3d-spike-report.md。这些开关只是让二进制**能**跑 3D;
+# 用不用由 QEMUCommandBuilder 的设备与显示参数决定,默认仍是 virtio-gpu-pci + VNC。
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-DIR="$(cd "$(dirname "$0")" && pwd)"
+# `pwd -P`:路径进了 --prefix,也就进了构建指纹。同一个目录经别名路径(这台机器上
+# /Users/deland/Development/Kyvenza 与 /Volumes/WD_SN570/... 是同一处)进来会算出另一个
+# 指纹,--check 就把刚建好的 QEMU 判成过期。
+ROOT="$(cd "$(dirname "$0")/../.." && pwd -P)"
+DIR="$(cd "$(dirname "$0")" && pwd -P)"
 
 QEMU_VERSION="${QEMU_VERSION:-11.1.0}"
 # 上游发布件的 sha256。换版本时必须一起更新,否则脚本会拒绝构建。
@@ -62,6 +72,25 @@ export SDKROOT="$QEMU_SDKROOT"
 QEMU_DEPLOYMENT_TARGET="${QEMU_DEPLOYMENT_TARGET:-26.0}"
 export MACOSX_DEPLOYMENT_TARGET="$QEMU_DEPLOYMENT_TARGET"
 
+# ── 图形加速依赖 ───────────────────────────────────────────────────
+# libepoxy 与 virglrenderer 是 QEMU 的链接期依赖,ANGLE 的头文件提供
+# EGL_PLATFORM_ANGLE_* 等定义。它们必须是 build_gfx.sh 按当前输入建出来的那份:
+# 链了一份旧的 virglrenderer,QEMU 与 render server 之间的协议就可能对不上。
+GFX_PREFIX="${ROOT}/.local/qemu/gfx"
+if [ "${1:-}" != "--check" ]; then
+    bash "${DIR}/build_gfx.sh" --check || exit 1
+fi
+export PKG_CONFIG_PATH="${GFX_PREFIX}/lib/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
+
+# spice-protocol(只有头文件)来自 build_deps26.sh。**只加 share/pkgconfig**:deps26 的
+# lib/pkgconfig 里还有 glib 等,加进来会改变 QEMU 链接哪一份 glib,那是另一回事。
+DEPS26_PREFIX="${ROOT}/.local/qemu/deps26"
+if [ "${1:-}" != "--check" ] && [ ! -f "${DEPS26_PREFIX}/share/pkgconfig/spice-protocol.pc" ]; then
+    echo "缺 ${DEPS26_PREFIX}/share/pkgconfig/spice-protocol.pc,先跑 make deps26" >&2
+    exit 1
+fi
+export PKG_CONFIG_PATH="${PKG_CONFIG_PATH}:${DEPS26_PREFIX}/share/pkgconfig"
+
 # ── configure 参数 ─────────────────────────────────────────────────
 # 抽成数组,是因为它和下面的构建指纹要共用同一份:参数改了,指纹必须跟着变。
 # 每一项砍掉的理由见 configure 段落的注释。
@@ -79,7 +108,8 @@ CONFIGURE_ARGS=(
     --disable-spice
     --enable-spice-protocol
     --disable-cocoa --disable-gtk --disable-sdl --disable-curses --disable-vte
-    --disable-opengl --disable-virglrenderer
+    --enable-opengl --enable-virglrenderer
+    --extra-cflags="-I${GFX_PREFIX}/include"
     --disable-capstone
     --disable-libssh --disable-libusb --disable-usb-redir
     --disable-smartcard --disable-u2f --disable-canokey
@@ -88,7 +118,7 @@ CONFIGURE_ARGS=(
     --disable-curl --disable-libiscsi --disable-libnfs --disable-rbd
     --disable-zstd --disable-lzo --disable-snappy --disable-bzip2 --disable-lzfse
     --disable-guest-agent
-    --disable-gio --disable-dbus-display
+    --enable-gio --enable-dbus-display
     --disable-seccomp
     --disable-virtfs --disable-vde --disable-netmap --disable-l2tpv3
     --disable-attr --disable-brlapi --disable-auth-pam
@@ -126,6 +156,10 @@ fingerprint_inputs() {
     echo "sha256=${QEMU_SHA256}"
     echo "sdk=$(basename "$SDKROOT")"
     echo "deployment_target=${QEMU_DEPLOYMENT_TARGET}"
+    # 图形依赖的指纹:换了 virglrenderer 或 libepoxy,QEMU 也要重链。
+    echo "gfx=$(shasum -a 256 "${GFX_PREFIX}/build.stamp" 2>/dev/null | awk '{print $1}')"
+    # 头文件进了 QEMU 的二进制,换版本也要重编。
+    echo "spice_protocol=$(grep -o 'spice-protocol=[^ ]*' "${DEPS26_PREFIX}/build.stamp" 2>/dev/null)"
     printf 'arg=%s\n' "${CONFIGURE_ARGS[@]}" | grep -v '^arg=--python='
     shopt -s nullglob
     for p in "${PATCH_DIR}"/*.patch; do
@@ -184,14 +218,25 @@ if [ ! -d "$SRC" ]; then
 fi
 
 # ── 打补丁 ─────────────────────────────────────────────────────────
-# `patch -N` 让脚本可以反复跑(已打过的跳过)。
+# 已打过的补丁按「文件名 + sha256」记在源码目录里,再跑时据此跳过。以前靠
+# `patch -R --dry-run` 反推「打过没有」,但后面的补丁改了同一段代码时(0007 起改的
+# 正是 0005 动过的地方)反向打不回去,增量构建就误报「补丁打不上」。
+# 补丁集一变,指纹就变,源码目录整个重来,所以这份记录不会和源码对不上。
+APPLIED_FILE="${SRC}/.kyvenza-applied-patches"
+touch "$APPLIED_FILE"
 shopt -s nullglob
 for p in "${PATCH_DIR}"/*.patch; do
-    if patch -p1 -N -s --dry-run -d "$SRC" < "$p" >/dev/null 2>&1; then
+    entry="$(basename "$p") $(shasum -a 256 "$p" | awk '{print $1}')"
+    if grep -qxF "$entry" "$APPLIED_FILE"; then
+        echo "==> 已打过,跳过 $(basename "$p")"
+    elif patch -p1 -N -s --dry-run -d "$SRC" < "$p" >/dev/null 2>&1; then
         echo "==> 打补丁 $(basename "$p")"
         patch -p1 -N -s -d "$SRC" < "$p"
+        echo "$entry" >> "$APPLIED_FILE"
     elif patch -p1 -R -s --dry-run -d "$SRC" < "$p" >/dev/null 2>&1; then
+        # 没有记录、但反向能打回去:记录文件出现之前打的补丁。
         echo "==> 已打过,跳过 $(basename "$p")"
+        echo "$entry" >> "$APPLIED_FILE"
     else
         echo "补丁打不上(源码版本可能变了): $p" >&2
         exit 1

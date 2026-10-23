@@ -1,0 +1,197 @@
+From: Joelle van Dyne <j@getutm.app>
+Date: Mon, 19 Oct 2026 14:11:03 +0800
+Subject: [PATCH] hvf: support changing IPA granule size
+
+Add an `ipa-granule-size` property to the HVF accelerator. On macOS 26 and
+later, hv_vm_config_set_ipa_granule() lets the VM use a 4 KiB stage-2
+granule instead of the host's 16 KiB page size. virtio-gpu guests that place
+host-visible blobs at 4 KiB offsets inside the hostmem window (the Windows
+viogpu3d driver does) cannot be mapped with a 16 KiB granule: the first guest
+access to such a blob traps without ISV and hits assert(isv).
+
+Based on a patch by Joelle van Dyne in utmapp/qemu (f7a8c0d5238), rewritten
+for the 11.1 accel/hvf layout. Only the public macOS 26 API is used; the
+fork's fallback to private API on older systems is dropped.
+---
+ accel/hvf/hvf-all.c      | 37 +++++++++++++++++++++++++++++++++++--
+ include/system/hvf_int.h |  5 ++++-
+ target/arm/hvf/hvf.c     | 40 ++++++++++++++++++++++++++++++++++++++--
+ target/i386/hvf/hvf.c    |  3 ++-
+ 4 files changed, 79 insertions(+), 6 deletions(-)
+
+diff --git a/accel/hvf/hvf-all.c b/accel/hvf/hvf-all.c
+index 8bd9154a50b..bbe0bc07627 100644
+--- a/accel/hvf/hvf-all.c
++++ b/accel/hvf/hvf-all.c
+@@ -12,6 +12,7 @@
+ #include "qemu/error-report.h"
+ #include "qapi/error.h"
+ #include "qapi/qapi-visit-common.h"
++#include "qapi/visitor.h"
+ #include "accel/accel-ops.h"
+ #include "exec/cpu-common.h"
+ #include "system/address-spaces.h"
+@@ -88,12 +89,14 @@ void hvf_unprotect_dirty_range(hwaddr addr, size_t size)
+                      HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
+ }
+ 
++uint32_t hvf_ipa_granule_size;
++
+ static void hvf_set_phys_mem(MemoryRegionSection *section, bool add)
+ {
+     MemoryRegion *area = section->mr;
+     bool writable = !area->readonly && !area->rom_device;
+     hv_memory_flags_t flags;
+-    uint64_t page_size = qemu_real_host_page_size();
++    uint64_t page_size = hvf_ipa_granule_size ?: qemu_real_host_page_size();
+     uint64_t gpa = section->offset_within_address_space;
+     uint64_t size = int128_get64(section->size);
+     hv_return_t ret;
+@@ -212,7 +215,7 @@ static int hvf_accel_init(AccelState *as, MachineState *ms)
+         }
+     }
+ 
+-    ret = hvf_arch_vm_create(ms, (uint32_t)pa_range);
++    ret = hvf_arch_vm_create(ms, (uint32_t)pa_range, hvf_ipa_granule_size);
+     if (ret == HV_DENIED) {
+         error_report("Could not access HVF. Is the executable signed"
+                      " with com.apple.security.hypervisor entitlement?");
+@@ -269,6 +272,31 @@ static void hvf_set_kernel_irqchip(Object *obj, Visitor *v,
+     }
+ }
+ 
++static void hvf_get_ipa_granule_size(Object *obj, Visitor *v,
++                                     const char *name, void *opaque,
++                                     Error **errp)
++{
++    uint32_t value = hvf_ipa_granule_size;
++
++    visit_type_uint32(v, name, &value, errp);
++}
++
++static void hvf_set_ipa_granule_size(Object *obj, Visitor *v,
++                                     const char *name, void *opaque,
++                                     Error **errp)
++{
++    uint32_t value;
++
++    if (!visit_type_uint32(v, name, &value, errp)) {
++        return;
++    }
++    if (value & (value - 1)) {
++        error_setg(errp, "ipa-granule-size must be a power of two");
++        return;
++    }
++    hvf_ipa_granule_size = value;
++}
++
+ static void hvf_accel_class_init(ObjectClass *oc, const void *data)
+ {
+     AccelClass *ac = ACCEL_CLASS(oc);
+@@ -282,6 +310,11 @@ static void hvf_accel_class_init(ObjectClass *oc, const void *data)
+         NULL, NULL);
+     object_class_property_set_description(oc, "kernel-irqchip",
+         "Configure HVF irqchip");
++    object_class_property_add(oc, "ipa-granule-size", "uint32",
++        hvf_get_ipa_granule_size, hvf_set_ipa_granule_size,
++        NULL, NULL);
++    object_class_property_set_description(oc, "ipa-granule-size",
++        "Size of a single guest page (0x1000 or 0x4000)");
+ }
+ 
+ static const TypeInfo hvf_accel_type = {
+diff --git a/include/system/hvf_int.h b/include/system/hvf_int.h
+index a01691ce172..5bc18989b41 100644
+--- a/include/system/hvf_int.h
++++ b/include/system/hvf_int.h
+@@ -58,7 +58,10 @@ void assert_hvf_ok_impl(hv_return_t ret, const char *file, unsigned int line,
+ #define assert_hvf_ok(EX) assert_hvf_ok_impl((EX), __FILE__, __LINE__, #EX)
+ const char *hvf_return_string(hv_return_t ret);
+ int hvf_arch_init(void);
+-hv_return_t hvf_arch_vm_create(MachineState *ms, uint32_t pa_range);
++/* Guest IPA granule in bytes, 0 for the host page size (see "ipa-granule-size"). */
++extern uint32_t hvf_ipa_granule_size;
++hv_return_t hvf_arch_vm_create(MachineState *ms, uint32_t pa_range,
++                               uint32_t ipa_granule_size);
+ uint32_t hvf_arch_get_default_ipa_bit_size(void);
+ uint32_t hvf_arch_get_max_ipa_bit_size(void);
+ void hvf_kick_vcpu_thread(CPUState *cpu);
+diff --git a/target/arm/hvf/hvf.c b/target/arm/hvf/hvf.c
+index da3ec521fc7..6df4c221215 100644
+--- a/target/arm/hvf/hvf.c
++++ b/target/arm/hvf/hvf.c
+@@ -1320,7 +1320,35 @@ static bool hvf_arm_el2_supported(void)
+ }
+ 
+ 
+-hv_return_t hvf_arch_vm_create(MachineState *ms, uint32_t pa_range)
++/*
++ * Guests that hand out 4 KiB-aligned host memory (virtio-gpu blobs from the
++ * Windows 3D driver) need a 4 KiB IPA granule; HVF defaults to 16 KiB.
++ * hv_vm_config_set_ipa_granule() is public API since macOS 26.
++ */
++static hv_return_t hvf_set_ipa_granule(hv_vm_config_t config,
++                                       uint32_t ipa_granule_size)
++{
++#if defined(__MAC_26_0) && __MAC_OS_X_VERSION_MAX_ALLOWED >= __MAC_26_0
++    if (__builtin_available(macOS 26, *)) {
++        hv_ipa_granule_t granule;
++
++        if (ipa_granule_size == 4096) {
++            granule = HV_IPA_GRANULE_4KB;
++        } else if (ipa_granule_size == 16384) {
++            granule = HV_IPA_GRANULE_16KB;
++        } else {
++            error_report("Unsupported IPA granule size: 0x%x", ipa_granule_size);
++            return HV_UNSUPPORTED;
++        }
++        return hv_vm_config_set_ipa_granule(config, granule);
++    }
++#endif
++    error_report("ipa-granule-size needs macOS 26 or later");
++    return HV_UNSUPPORTED;
++}
++
++hv_return_t hvf_arch_vm_create(MachineState *ms, uint32_t pa_range,
++                               uint32_t ipa_granule_size)
+ {
+     hv_return_t ret;
+     hv_vm_config_t config = hv_vm_config_create();
+@@ -1345,6 +1373,13 @@ hv_return_t hvf_arch_vm_create(MachineState *ms, uint32_t pa_range)
+         }
+     }
+ 
++    if (ipa_granule_size) {
++        ret = hvf_set_ipa_granule(config, ipa_granule_size);
++        if (ret != HV_SUCCESS) {
++            goto cleanup;
++        }
++    }
++
+     ret = hv_vm_create(config);
+     if (hvf_irqchip_in_kernel()) {
+         if (__builtin_available(macOS 15.0, *)) {
+@@ -2407,7 +2442,8 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
+                                                        NULL, true,
+                                                        MEMTXATTRS_UNSPECIFIED);
+             if (memory_region_is_ram(mr)) {
+-                uintptr_t page_size = qemu_real_host_page_size();
++                uintptr_t page_size = hvf_ipa_granule_size ?:
++                                      qemu_real_host_page_size();
+                 intptr_t page_mask = -(intptr_t)page_size;
+                 uint64_t ipa_page = ipa & page_mask;
+ 
+diff --git a/target/i386/hvf/hvf.c b/target/i386/hvf/hvf.c
+index 150598418e2..a73ee8f8614 100644
+--- a/target/i386/hvf/hvf.c
++++ b/target/i386/hvf/hvf.c
+@@ -239,7 +239,8 @@ uint32_t hvf_arch_get_max_ipa_bit_size(void)
+     g_assert_not_reached();
+ }
+ 
+-hv_return_t hvf_arch_vm_create(MachineState *ms, uint32_t pa_range)
++hv_return_t hvf_arch_vm_create(MachineState *ms, uint32_t pa_range,
++                               uint32_t ipa_granule_size)
+ {
+     return hv_vm_create(HV_VM_DEFAULT);
+ }

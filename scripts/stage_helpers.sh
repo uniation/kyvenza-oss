@@ -7,7 +7,8 @@
 #   Contents/Helpers/qemu-system-aarch64      可执行文件
 #   Contents/Helpers/qemu-img
 #   Contents/Helpers/swtpm
-#   Contents/Frameworks/*.dylib               动态库闭包
+#   Contents/Helpers/virgl_render_server      图形加速的渲染进程(由 QEMU 拉起)
+#   Contents/Frameworks/*.dylib               动态库闭包(含 dlopen 加载的 ANGLE 与 DXMT)
 #   Contents/Resources/qemu/secboot-code.fd   带 Secure Boot 的 UEFI 固件(只读)
 #   Contents/Resources/qemu/secboot-vars.fd   预置微软 PK/KEK/db 的 NVRAM 模板
 #   Contents/Resources/qemu/share/…           QEMU 的 ROM 数据目录(-L)
@@ -44,6 +45,19 @@ if [ -z "${SWTPM_BIN:-}" ]; then
 fi
 FIRMWARE_DIR="${FIRMWARE_DIR:-${ROOT}/.local/qemu/firmware}"
 VIRTIO_WIN_ISO="${VIRTIO_WIN_ISO:-${ROOT}/.local/qemu/virtio-win.iso}"
+GFX_PREFIX="${GFX_PREFIX:-${ROOT}/.local/qemu/gfx}"
+# 不在链接闭包里、由别人 dlopen 的库。otool 看不到它们,漏了也不会在组包时报错,
+# 只会在用户打开图形加速时才发现客体没有画面。所以单独列出、缺了就失败:
+#   libEGL / libGLESv2   ANGLE,libepoxy 按 @loader_path 加载 libEGL,libEGL 再在自己旁边
+#                        找 libGLESv2(两者必须同目录)
+#   libdxmt-native       DXMT,render server 按 @rpath 加载
+GFX_DLOPEN_LIBS="libEGL.dylib libGLESv2.dylib libdxmt-native.dylib"
+# 图形加速的客体驱动(viogpu3d + Neptune UMD),UTM 发布的 Microsoft attestation 签名版。
+# 按 GitHub 公布的 sha256 钉死,缺了自动下载。版本跟着 UTM 走,升级时改这三行并实测一次。
+VIOGPU3D_VERSION="v0.4"
+VIOGPU3D_URL="https://github.com/osy/kvm-guest-drivers-windows/releases/download/${VIOGPU3D_VERSION}/viogpu3d-arm64x-signed.zip"
+VIOGPU3D_SHA256="512da8ef87eaf4f65282e2535bf1dc2b32b0b0f825508093532fbb1ab0b09116"
+VIOGPU3D_ZIP="${VIOGPU3D_ZIP:-${ROOT}/.local/qemu/viogpu3d-${VIOGPU3D_VERSION}-arm64x-signed.zip}"
 
 HELPERS="${APP}/Contents/Helpers"
 FRAMEWORKS="${APP}/Contents/Frameworks"
@@ -86,6 +100,17 @@ fi
 # swtpm 是可执行文件,不走下面按文件名覆盖 dylib 的那条路,所以在这里单独把关。
 [ "$SWTPM_BIN" = "${DEPS26_PREFIX}/bin/swtpm" ] && [ -f "$DEPS26_STAMP" ] || \
     require "swtpm 取自 ${SWTPM_BIN},不是 build_deps26.sh 的产物。先跑 make deps26"
+# QEMU 链接了 libepoxy 与 virglrenderer,所以缺图形依赖的话 QEMU 本身就起不来,
+# 这一条对调试包也不能放行。
+[ -x "${GFX_PREFIX}/libexec/virgl_render_server" ] || \
+    die "缺图形加速依赖 ${GFX_PREFIX},先跑 make gfx"
+for lib in $GFX_DLOPEN_LIBS; do
+    [ -f "${GFX_PREFIX}/lib/${lib}" ] || die "缺 ${GFX_PREFIX}/lib/${lib},先跑 make gfx"
+done
+if [ "$GFX_PREFIX" = "${ROOT}/.local/qemu/gfx" ]; then
+    bash "${ROOT}/scripts/qemu/build_gfx.sh" --check >/dev/null 2>&1 || \
+        require "图形加速依赖与当前 build_gfx.sh / gfx-patches 不对应,先跑 make gfx"
+fi
 
 rm -rf "$HELPERS" "$DATA"
 mkdir -p "$HELPERS" "$FRAMEWORKS" "$DATA"
@@ -95,6 +120,7 @@ for exe in qemu-system-aarch64 qemu-img; do
     cp "${QEMU_PREFIX}/bin/${exe}" "${HELPERS}/${exe}"
 done
 cp "$SWTPM_BIN" "${HELPERS}/swtpm"
+cp "${GFX_PREFIX}/libexec/virgl_render_server" "${HELPERS}/virgl_render_server"
 chmod u+w "${HELPERS}"/*
 
 # ── 动态库闭包 ─────────────────────────────────────────────────────
@@ -104,8 +130,11 @@ chmod u+w "${HELPERS}"/*
 # 这里一律走临时文件,别改成 bash 4 的写法。
 QUEUE_FILE="$(mktemp)"; SEEN_FILE="$(mktemp)"
 trap 'rm -f "$QUEUE_FILE" "$SEEN_FILE"' EXIT
-for exe in qemu-system-aarch64 qemu-img swtpm; do
+for exe in qemu-system-aarch64 qemu-img swtpm virgl_render_server; do
     echo "${HELPERS}/${exe}" >> "$QUEUE_FILE"
+done
+for lib in $GFX_DLOPEN_LIBS; do
+    echo "${GFX_PREFIX}/lib/${lib}" >> "$QUEUE_FILE"
 done
 while [ -s "$QUEUE_FILE" ]; do
     cur="$(head -1 "$QUEUE_FILE")"
@@ -156,6 +185,9 @@ if [ -f "$DEPS26_STAMP" ]; then
         fi
     done
 fi
+# 图形加速的库由 build_gfx.sh 同样按 26.0 从源码编出(有自己的指纹检查,见上),也算重编产物。
+GFX_LIB_REAL="$(/usr/bin/python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${GFX_PREFIX}/lib")"
+grep "^${GFX_LIB_REAL}/" "$SEEN_FILE" | while read -r lib; do basename "$lib"; done >> "$REPLACED_FILE"
 # 每一个进包的库都必须是重编产物。漏一个,就是有个 Homebrew 的二进制被带进了包:
 # 今天它恰好还是 26.0,哪台机器 brew upgrade 一次就变成 27.0(2026-10-20 新装的机器上就是这样)。
 # 闭包里冒出一个 build_deps26.sh 没编的新库,也停在这里,而不是等最后那道 minos 守卫碰运气。
@@ -180,6 +212,9 @@ for lib in "${FRAMEWORKS}"/*.dylib; do
         libpixman-1.*) ;;                                                 # MIT
         libslirp.*|libpcre2-8.*|libtpms.*|libswtpm_libtpms.*) ;;          # BSD
         libcrypto.*) ;;                                                   # Apache-2.0 (OpenSSL)
+        libepoxy.*|libvirglrenderer.*) ;;                                 # MIT
+        libEGL.dylib|libGLESv2.dylib) ;;                                  # BSD-3-Clause (ANGLE)
+        libdxmt-native.dylib) ;;                                          # LGPL-2.1 → DXMT(静态含 LLVM,Apache-2.0)
         *)
             die "$(basename "$lib") 不在许可白名单里。先查清它的许可,把它加进 build_deps26.sh
   (SOURCES 里写明许可,collect_sources.sh 会据此交付源码),并在 Open Source Notices 里列出;
@@ -207,10 +242,14 @@ strip_signature() {
     codesign --remove-signature "$1" 2>/dev/null || true
 }
 
-for exe in qemu-system-aarch64 qemu-img swtpm; do
+for exe in qemu-system-aarch64 qemu-img swtpm virgl_render_server; do
     strip_signature "${HELPERS}/${exe}"
     rewrite "${HELPERS}/${exe}" '@executable_path/../Frameworks'
 done
+# virglrenderer 按 @rpath/libdxmt-native.dylib 打开 DXMT(gfx-patches/virglrenderer),
+# 而 dlopen 的 @rpath 取的是主程序的 LC_RPATH。render server 的每个上下文 worker
+# 也是它自己再 posix_spawn 一次,主程序始终是它。
+install_name_tool -add_rpath '@executable_path/../Frameworks' "${HELPERS}/virgl_render_server"
 for lib in "${FRAMEWORKS}"/*.dylib; do
     strip_signature "$lib"
     install_name_tool -id "@loader_path/$(basename "$lib")" "$lib"
@@ -271,6 +310,31 @@ if [ -f "$VIRTIO_WIN_ISO" ]; then
     done
     cp "${MOUNT}/virtio-win_license.txt" "${STAGE_DIR}/LICENSE.txt"
 
+    # ── 图形加速驱动(viogpu3d)──────────────────────────────────
+    # **原样放 UTM 发布的 zip,不解开、不摊平。** 三个理由,都是实测出来的:
+    # 1) OOBE「安装驱动程序」会递归扫描整张盘的 .inf。viogpu3d 与 viogpudo 认同一个
+    #    硬件 ID,日期更新的 viogpu3d 总是赢;而它在普通 virtio-gpu 上启动失败
+    #    (Code 43),**画面永久全黑**。没开加速的 VM 一个都不能让它装上。
+    # 2) 同理,上面 `pnputil /add-driver *.inf` 也会把它装上。
+    # 3) zip 里的 vgpusrv.exe / viogpuap.exe 与 viogpudo 那两个同名不同版本。
+    # zip 的 sha256 与 GitHub 公布的一致,客体里的东西可以逐字节对回上游发布。
+    if [ ! -f "$VIOGPU3D_ZIP" ]; then
+        echo "stage_helpers: 下载 viogpu3d ${VIOGPU3D_VERSION}" >&2
+        mkdir -p "$(dirname "$VIOGPU3D_ZIP")"
+        curl -fsSL -o "${VIOGPU3D_ZIP}.part" "$VIOGPU3D_URL" || die "下载 viogpu3d 失败: ${VIOGPU3D_URL}"
+        mv "${VIOGPU3D_ZIP}.part" "$VIOGPU3D_ZIP"
+    fi
+    [ "$(shasum -a 256 "$VIOGPU3D_ZIP" | awk '{print $1}')" = "$VIOGPU3D_SHA256" ] || \
+        die "${VIOGPU3D_ZIP} 的 sha256 与钉住的不符(删掉它重新下载,或核对上游是否换了文件)"
+    # 不用 grep -q:它一匹配就退出,unzip 写管道收到 SIGPIPE,pipefail 下整条判失败。
+    unzip -Z1 "$VIOGPU3D_ZIP" | grep -x "drivers/viogpu3d/viogpu3d.inf" >/dev/null || \
+        die "${VIOGPU3D_ZIP} 里没有 drivers/viogpu3d/viogpu3d.inf,安装脚本按这个路径找"
+    cp "$VIOGPU3D_ZIP" "${STAGE_DIR}/Kyvenza-3D-Graphics.zip"
+    # 许可全文随驱动上盘:BSD 与 MIT 都要求二进制分发时附上许可文本,而 App 里只编入了
+    # GPL/LGPL 全文。CRLF:记事本以外的 Windows 工具看 LF 文件会挤成一行。
+    /usr/bin/python3 -c 'import sys; t=open(sys.argv[1]).read(); open(sys.argv[2],"w",newline="").write(t.replace("\n","\r\n"))' \
+        "${ROOT}/scripts/qemu/guest-licenses/LICENSE-3D-Graphics.txt" "${STAGE_DIR}/LICENSE-3D-Graphics.txt"
+
     # ── 剪贴板代理(vdagent)────────────────────────────────────
     # 与三个驱动一起摊在盘根目录。**全世界没有现成的 ARM64 版本**(上游只发
     # x86/x64,UTM 的安装器里那一支写着 TODO),所以这两个 exe 是我们自己交叉
@@ -329,22 +393,51 @@ rem pnputil returns non-zero on success too: 259 means there was nothing new to
 rem add (the normal case when the drivers are already installed), 3010 means it
 rem installed them but wants a reboot. Treating those as failures skips
 rem everything below.
-if %PNPRESULT% equ 0 goto clipboard
-if %PNPRESULT% equ 259 goto clipboard
-if %PNPRESULT% equ 3010 goto clipboard
+if %PNPRESULT% equ 0 goto display
+if %PNPRESULT% equ 259 goto display
+if %PNPRESULT% equ 3010 goto display
 set DRIVERS=failed
 echo    Driver installation reported code %PNPRESULT%.
+
+:display
+rem Everything below that has to outlive this disc lives here: services and
+rem scheduled tasks record absolute paths, and those break the moment the disc
+rem is ejected or swapped.
+set "KYVDIR=%ProgramFiles%\Kyvenza"
+if not exist "%KYVDIR%" mkdir "%KYVDIR%"
+echo.
+echo    Setting up the display driver...
+echo.
+rem Kyvenza starts this VM with one of two virtual graphics adapters, and each
+rem needs its own driver: viogpudo for the standard one, viogpu3d when graphics
+rem acceleration is on. Both claim the same hardware ID and Windows always picks
+rem the newer viogpu3d - which fails to start on the standard adapter (Code 43)
+rem and leaves the screen black for good. So exactly one of the two may be in
+rem the driver store, and the step above has just put viogpudo back. The
+rem script below removes whichever one does not match Kyvenza's setting.
+rem It also runs at every startup, so switching acceleration on or off in
+rem Kyvenza takes effect on the next boot without running this installer again.
+rem Both drivers are kept on the system drive for that, since the startup task
+rem cannot count on this disc being in the drive.
+if exist "%KYVDIR%\viogpudo" rmdir /s /q "%KYVDIR%\viogpudo"
+mkdir "%KYVDIR%\viogpudo"
+copy /Y "%~dp0viogpudo.*" "%KYVDIR%\viogpudo\" >nul
+rem viogpu3d stays zipped on this disc so that nothing that scans the disc for
+rem drivers (Windows Setup's "Install driver" button, the pnputil step above)
+rem can install it by accident. tar ships with Windows and reads zip files.
+if exist "%KYVDIR%\viogpu3d" rmdir /s /q "%KYVDIR%\viogpu3d"
+mkdir "%KYVDIR%\viogpu3d"
+tar -xf "%~dp0Kyvenza-3D-Graphics.zip" -C "%KYVDIR%\viogpu3d"
+copy /Y "%~dp0Set-Kyvenza-Display.ps1" "%KYVDIR%\" >nul
+schtasks /create /tn "Kyvenza Display Driver" /sc onstart /ru SYSTEM /rl highest /f /tr "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%KYVDIR%\Set-Kyvenza-Display.ps1\" -Quiet" >nul 2>&1
+if errorlevel 1 echo    Could not register the startup task for the display driver.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%KYVDIR%\Set-Kyvenza-Display.ps1"
 
 :clipboard
 echo.
 echo    Installing the clipboard agent...
 echo.
 rem The clipboard agent is independent of the drivers, so it installs either way.
-rem The service records an absolute path to its executable, so the agent has to
-rem live on the system drive. Registering it straight off this disc would break
-rem the moment the disc is ejected or swapped.
-set "KYVDIR=%ProgramFiles%\Kyvenza"
-if not exist "%KYVDIR%" mkdir "%KYVDIR%"
 rem Stop the old copy BEFORE overwriting it. On an upgrade the running agent
 rem holds its own executable open, so copying first fails with "another program
 rem is using this file" while the installer still reports success - the service
@@ -553,9 +646,95 @@ for %%d in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do (
 exit /b 1
 """
 
+# 显示驱动二选一。由安装器调一次,之后每次开机由 SYSTEM 的计划任务调。
+# 模式标记在 KYVENZA 脚本盘上(宿主每次启动重写,`WindowsDisplayGuestScript`),
+# 与 SSH 公钥同理:这张光盘所有 VM 共用,不能带每台 VM 的设置。
+# 驱动库用 Get-WindowsDriver 查,不解析 pnputil 的输出 —— 那是本地化的
+# (中文系统上是「原始名称」「发布名称」)。
+display = r"""# Kyvenza: keep exactly one VirtIO display driver in the driver store, the one
+# that matches the graphics adapter Kyvenza starts this VM with.
+#
+#   viogpudo  standard adapter (graphics acceleration off)
+#   viogpu3d  3D adapter (graphics acceleration on)
+#
+# Both match the same hardware ID, and Windows always prefers the newer
+# viogpu3d. On the standard adapter viogpu3d fails to start (Code 43) and the
+# screen stays black, so the other driver is removed, not just outranked.
+# Kyvenza writes the current setting to Kyvenza-Graphics.txt on the KYVENZA
+# disc at every boot. With no such file this script changes nothing.
+param([switch]$Quiet)
+
+$dir = Join-Path $env:ProgramFiles 'Kyvenza'
+$log = Join-Path $dir 'display.log'
+function Say([string]$message) {
+    Add-Content -LiteralPath $log -Value ((Get-Date -Format s) + ' ' + $message) -ErrorAction SilentlyContinue
+    if (-not $Quiet) { Write-Host ('   ' + $message) }
+}
+
+$mode = $null
+foreach ($drive in Get-PSDrive -PSProvider FileSystem) {
+    $marker = Join-Path $drive.Root 'Kyvenza-Graphics.txt'
+    if (Test-Path -LiteralPath $marker) {
+        $mode = (Get-Content -LiteralPath $marker -TotalCount 1).Trim()
+        break
+    }
+}
+switch ($mode) {
+    'accelerated' { $want = 'viogpu3d'; $other = 'viogpudo' }
+    'basic'       { $want = 'viogpudo'; $other = 'viogpu3d' }
+    default {
+        Say 'Graphics setting not found on the KYVENZA disc; display driver left as is.'
+        exit 0
+    }
+}
+
+function Find-Package([string]$name) {
+    @(Get-WindowsDriver -Online | Where-Object {
+        [IO.Path]::GetFileName($_.OriginalFileName) -ieq ($name + '.inf')
+    })
+}
+
+$changed = $false
+if ((Find-Package $want).Count -eq 0) {
+    $inf = Get-ChildItem -LiteralPath (Join-Path $dir $want) -Recurse -Filter ($want + '.inf') -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if (-not $inf) {
+        Say ('Missing ' + $want + ' under ' + $dir + '. Run Install-Kyvenza-Drivers again.')
+        exit 1
+    }
+    & pnputil.exe /add-driver $inf.FullName /install | Out-Null
+    # 259: nothing new to add. 3010: added, reboot requested. Both are success.
+    if (@(0, 259, 3010) -notcontains $LASTEXITCODE) {
+        Say ('Adding ' + $want + ' failed with code ' + $LASTEXITCODE + '.')
+        exit 1
+    }
+    $changed = $true
+}
+foreach ($package in Find-Package $other) {
+    # /uninstall also takes it off the device, so Windows rebinds the adapter
+    # to the remaining driver right away, without a reboot.
+    & pnputil.exe /delete-driver $package.Driver /uninstall | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Say ('Removing ' + $other + ' (' + $package.Driver + ') failed with code ' + $LASTEXITCODE + '.')
+        exit 1
+    }
+    $changed = $true
+}
+if ($changed) { & pnputil.exe /scan-devices | Out-Null }
+
+$adapter = Get-PnpDevice -Class Display -PresentOnly -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($adapter) {
+    Say ('Graphics ' + $mode + ': ' + $adapter.FriendlyName + ', ' + $adapter.Status + '.')
+} else {
+    Say ('Graphics ' + $mode + ': ' + $want + ' is the display driver.')
+}
+exit 0
+"""
+
 for name, text in (("Install-Kyvenza-Drivers.cmd", script),
                    ("Find-Kyvenza-Shares.cmd", finder),
-                   ("Find-Kyvenza-SSH.cmd", ssh_finder)):
+                   ("Find-Kyvenza-SSH.cmd", ssh_finder),
+                   ("Set-Kyvenza-Display.ps1", display)):
     out = os.path.join(sys.argv[1], name)
     io.open(out, "wb").write(text.replace("\n", "\r\n").encode("ascii"))
 PYEOF

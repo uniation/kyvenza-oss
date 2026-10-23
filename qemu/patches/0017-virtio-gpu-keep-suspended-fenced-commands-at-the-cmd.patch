@@ -1,0 +1,95 @@
+From: osy <osy@turing.llc>
+Date: Tue, 26 May 2026 23:33:22 -0700
+Subject: [PATCH] virtio-gpu: keep suspended fenced commands at the cmdq head
+
+When virgl_cmd_resource_unmap_blob() or virgl_cmd_resource_unref()
+suspends the command to wait for the hostmem MemoryRegion to be freed,
+process_cmd returns without calling virgl_renderer_create_fence(), so
+no fence has been registered for the command yet.  However, the cmd
+still carries VIRTIO_GPU_FLAG_FENCE, so the existing
+"!finished && !fenced" check in virtio_gpu_process_cmdq() falls
+through and moves the command from cmdq to fenceq.  No fence id will
+ever match it in virgl_write_{,context_}fence(), the command sits on
+fenceq forever, and g->inflight grows unboundedly.
+
+Track suspend state explicitly on the command and gate the
+cmdq-to-fenceq transition on it so the command stays at the head of
+cmdq and is re-processed once the async teardown completes.  The
+flag is initialized in both handle_ctrl paths since virtqueue_pop()
+does not zero the allocation.
+
+Assisted-by: Claude:claude-opus-4-7
+(cherry picked from utmapp/qemu commit c4fc99c8b412436f14e75285a842df33612e6748)
+---
+ hw/display/virtio-gpu-gl.c     |  1 +
+ hw/display/virtio-gpu-virgl.c  |  2 ++
+ hw/display/virtio-gpu.c        | 10 ++++++++--
+ include/hw/virtio/virtio-gpu.h |  2 ++
+ 4 files changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/hw/display/virtio-gpu-gl.c b/hw/display/virtio-gpu-gl.c
+index d333b0544ee..cd24286fca2 100644
+--- a/hw/display/virtio-gpu-gl.c
++++ b/hw/display/virtio-gpu-gl.c
+@@ -79,6 +79,7 @@ static void virtio_gpu_gl_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
+         cmd->vq = vq;
+         cmd->error = 0;
+         cmd->finished = false;
++        cmd->suspended = false;
+         QTAILQ_INSERT_TAIL(&g->cmdq, cmd, next);
+         cmd = virtqueue_pop(vq, sizeof(struct virtio_gpu_ctrl_command));
+     }
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index 17f8070c8c4..38abc867d29 100644
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -1225,6 +1225,8 @@ void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
+         break;
+     }
+ 
++    cmd->suspended = cmd_suspended;
++
+     if (cmd_suspended || cmd->finished) {
+         return;
+     }
+diff --git a/hw/display/virtio-gpu.c b/hw/display/virtio-gpu.c
+index fe830bcb9f3..c368b093cfd 100644
+--- a/hw/display/virtio-gpu.c
++++ b/hw/display/virtio-gpu.c
+@@ -1138,8 +1138,13 @@ void virtio_gpu_process_cmdq(VirtIOGPU *g)
+         /* process command */
+         vgc->process_cmd(g, cmd);
+ 
+-        /* command suspended */
+-        if (!cmd->finished && !(cmd->cmd_hdr.flags & VIRTIO_GPU_FLAG_FENCE)) {
++        /*
++         * A suspended command has not registered its fence (if any) yet
++         * and must be re-processed at the cmdq head after resume, so it
++         * must not be moved to fenceq like a normal in-flight fence.
++         */
++        if (cmd->suspended ||
++            (!cmd->finished && !(cmd->cmd_hdr.flags & VIRTIO_GPU_FLAG_FENCE))) {
+             trace_virtio_gpu_cmd_suspended(cmd->cmd_hdr.type);
+             break;
+         }
+@@ -1203,6 +1208,7 @@ static void virtio_gpu_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
+         cmd->vq = vq;
+         cmd->error = 0;
+         cmd->finished = false;
++        cmd->suspended = false;
+         QTAILQ_INSERT_TAIL(&g->cmdq, cmd, next);
+         cmd = virtqueue_pop(vq, sizeof(struct virtio_gpu_ctrl_command));
+     }
+diff --git a/include/hw/virtio/virtio-gpu.h b/include/hw/virtio/virtio-gpu.h
+index 5773e4b3744..82766981432 100644
+--- a/include/hw/virtio/virtio-gpu.h
++++ b/include/hw/virtio/virtio-gpu.h
+@@ -144,6 +144,8 @@ struct virtio_gpu_ctrl_command {
+     struct virtio_gpu_ctrl_hdr cmd_hdr;
+     uint32_t error;
+     bool finished;
++    /* Set if process_cmd deferred completion; keep at cmdq head for resume. */
++    bool suspended;
+     QTAILQ_ENTRY(virtio_gpu_ctrl_command) next;
+ };
+ 

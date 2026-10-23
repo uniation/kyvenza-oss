@@ -1,0 +1,42 @@
+From: osy <osy@turing.llc>
+Date: Thu, 16 Jul 2026 21:08:37 -0700
+Subject: [PATCH] virtio-gpu: retire fences immediately when the renderer
+ context is dead
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+virgl_renderer_context_create_fence fails when the proxy render worker
+has died (crashed mid-teardown); the fence was silently dropped, never
+signaled, and the guest GPU scheduler eventually bugchecked
+(VIDEO_TDR_FAILURE) waiting on it.  Respond OK right away instead —
+the cmd is not on fenceq yet at this point, so the response both
+signals the fence and keeps it off the queue.
+
+Assisted-by: Claude:claude-fable-5
+
+(cherry picked from utmapp/qemu commit a0f453befd; ui/console API renamed for 11.1)
+---
+ hw/display/virtio-gpu-virgl.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index 5071f3f1bc6..643756b1307 100644
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -1232,6 +1232,15 @@ void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
+             qemu_log_mask(LOG_GUEST_ERROR,
+                           "%s: virgl_renderer_context_create_fence error: %s",
+                           __func__, strerror(-ret));
++            /*
++             * The renderer context is gone (e.g. its render-server worker
++             * died mid-teardown): this fence can never retire through the
++             * timeline.  Complete it now; the cmd is not on fenceq yet, so
++             * responding both signals the fence and keeps it off the queue.
++             * Leaving it pending wedges the guest's GPU scheduler
++             * (VIDEO_TDR_FAILURE bugcheck on Windows).
++             */
++            virtio_gpu_ctrl_response_nodata(g, cmd, VIRTIO_GPU_RESP_OK_NODATA);
+         }
+         return;
+     }

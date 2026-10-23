@@ -1,0 +1,120 @@
+From: Joelle van Dyne <j@getutm.app>
+Date: Sun, 30 Nov 2025 15:50:56 -0800
+Subject: [PATCH] virtio-gpu-virgl: add support for native blob scanout
+
+On macOS we do not have dmabuf and so we use MTLTexture as our scanout
+source. For blob scanout, the buffer is untyped and so we cannot get a
+MTLTexture until we pass more information to virglrenderer (surface size,
+pixel format, etc). The new API to do this is currently unstable so we
+need to define `VIRGL_RENDERER_UNSTABLE_APIS`. This should be removed after
+the ABI becomes stable.
+
+Signed-off-by: Joelle van Dyne <j@getutm.app>
+
+(cherry picked from utmapp/qemu commit b64cf290f7; ui/console API renamed for 11.1)
+---
+ hw/display/virtio-gpu-virgl.c | 60 +++++++++++++++++++++++++++++++++++
+ meson.build                   |  5 +++
+ 2 files changed, 65 insertions(+)
+
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index 68bb764f0b1..a3fc2397abf 100644
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -22,6 +22,7 @@
+ 
+ #include "ui/egl-helpers.h"
+ 
++#define VIRGL_RENDERER_UNSTABLE_APIS
+ #include <virglrenderer.h>
+ 
+ /*
+@@ -996,6 +997,59 @@ static void virgl_cmd_resource_unmap_blob(VirtIOGPU *g,
+     }
+ }
+ 
++#if defined(HAVE_VIRGL_RENDERER_NATIVE_SCANOUT)
++static void virgl_scanout_native_blob_cleanup(ScanoutTextureNative *native)
++{
++    assert(native->type == SCANOUT_TEXTURE_NATIVE_TYPE_METAL);
++    virgl_renderer_release_handle_for_scanout(VIRGL_NATIVE_HANDLE_METAL_TEXTURE,
++                                              native->handle);
++}
++
++static bool virgl_scanout_native_blob(VirtIOGPU *g,
++                                      struct virtio_gpu_set_scanout_blob *ss)
++{
++    struct virtio_gpu_scanout *scanout = &g->parent_obj.scanout[ss->scanout_id];
++    enum virgl_renderer_native_handle_type type;
++    virgl_renderer_native_handle handle;
++    ScanoutTextureNative native;
++
++    type = virgl_renderer_create_handle_for_scanout(ss->resource_id,
++                                                    ss->width,
++                                                    ss->height,
++                                                    ss->format,
++                                                    ss->padding,
++                                                    ss->strides[0],
++                                                    ss->offsets[0],
++                                                    &handle);
++#ifdef CONFIG_METAL
++    if (type == VIRGL_NATIVE_HANDLE_METAL_TEXTURE) {
++        native = (ScanoutTextureNative){
++            .type = SCANOUT_TEXTURE_NATIVE_TYPE_METAL,
++            .handle = handle,
++        };
++        qemu_console_resize(scanout->con,
++                            ss->r.width, ss->r.height);
++        qemu_console_gl_scanout_texture(
++            scanout->con, 0,
++            false,
++            ss->width, ss->height,
++            ss->r.x, ss->r.y, ss->r.width, ss->r.height,
++            native, virgl_scanout_native_blob_cleanup);
++        scanout->resource_id = ss->resource_id;
++
++        return true;
++    }
++#endif
++
++    /* don't leak memory if handle type is unknown */
++    if (type != VIRGL_NATIVE_HANDLE_NONE) {
++        virgl_renderer_release_handle_for_scanout(type, handle);
++    }
++
++    return false;
++}
++#endif
++
+ static void virgl_cmd_set_scanout_blob(VirtIOGPU *g,
+                                        struct virtio_gpu_ctrl_command *cmd)
+ {
+@@ -1027,6 +1081,12 @@ static void virgl_cmd_set_scanout_blob(VirtIOGPU *g,
+         return;
+     }
+ 
++#if defined(HAVE_VIRGL_RENDERER_NATIVE_SCANOUT)
++    if (virgl_scanout_native_blob(g, &ss)) {
++        return;
++    }
++#endif
++
+     res = virtio_gpu_virgl_find_resource(g, ss.resource_id);
+     if (!res) {
+         qemu_log_mask(LOG_GUEST_ERROR, "%s: resource does not exist %d\n",
+diff --git a/meson.build b/meson.build
+index edb821ec439..c2edc3aaf41 100644
+--- a/meson.build
++++ b/meson.build
+@@ -2515,6 +2515,11 @@ config_host_data.set('CONFIG_VNC', vnc.found())
+ config_host_data.set('CONFIG_VNC_JPEG', jpeg.found())
+ config_host_data.set('CONFIG_VNC_SASL', sasl.found())
+ if virgl.found()
++  config_host_data.set('HAVE_VIRGL_RENDERER_NATIVE_SCANOUT',
++                        cc.has_function('virgl_renderer_create_handle_for_scanout',
++                                        args: '-DVIRGL_RENDERER_UNSTABLE_APIS',
++                                        prefix: '#include <virglrenderer.h>',
++                                        dependencies: virgl))
+   config_host_data.set('VIRGL_VERSION_MAJOR', virgl.version().split('.')[0])
+   config_host_data.set('VIRGL_VERSION_MINOR', virgl.version().split('.')[1])
+   config_host_data.set('VIRGL_VERSION_MICRO', virgl.version().split('.')[2])

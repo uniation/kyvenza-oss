@@ -68,12 +68,13 @@ done
 
 # 2) 可执行文件。只有 qemu-system-aarch64 需要 hypervisor entitlement ——
 #    qemu-img 只读写磁盘镜像,swtpm 只跑 TPM 模拟,都不碰 Hypervisor.framework。
-#    最小权限:不该给的不给。
+#    virgl_render_server 只做 Metal 渲染(DXMT 生成的是着色器字节码,不 JIT),
+#    也不需要。最小权限:不该给的不给。
 codesign --force --timestamp $RUNTIME_FLAG \
     --entitlements "$HYPERVISOR_ENTITLEMENTS" \
     --sign "$IDENTITY" "${HELPERS}/qemu-system-aarch64"
 
-for exe in qemu-img swtpm; do
+for exe in qemu-img swtpm virgl_render_server; do
     codesign --force --timestamp $RUNTIME_FLAG \
         --entitlements "$HELPER_ENTITLEMENTS" \
         --sign "$IDENTITY" "${HELPERS}/${exe}"

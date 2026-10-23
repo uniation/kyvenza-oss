@@ -1,0 +1,269 @@
+From: Kyvenza <support@kyvenza.com>
+Date: Mon, 19 Oct 2026 22:00:00 +0800
+Subject: [PATCH] ui/dbus: deliver GL scanouts on macOS through Unix.Map
+
+dbus_scanout_texture() only handles CONFIG_GBM (dmabuf export) and WIN32
+(shared D3D texture or readback). On macOS a GL or native Metal scanout
+reached the D-Bus display and went nowhere, so a client never saw the 3D
+output.
+
+Add a third path: hold the Metal texture of a native scanout and, on every
+gl_update, copy the dirty rectangle into the shareable display surface
+(blitting first when the texture is private), then emit the existing
+org.qemu.Display1.Listener.Unix.Map UpdateMap. RGBA textures are swizzled
+in place. The client keeps using the documented Unix.Map interface; nothing
+new crosses the process boundary.
+
+With GL enabled, also keep the main loop on the main thread (qemu_main =
+NULL), as the GTK and SDL backends do: otherwise the loop runs on a thread
+with no current EGL context and libepoxy dispatches into the system
+OpenGL.framework.
+---
+ ui/dbus-listener-metal.m | 84 ++++++++++++++++++++++++++++++++++++++++
+ ui/dbus-listener.c       | 46 +++++++++++++++++++++-
+ ui/dbus-metal.h          | 14 +++++++
+ ui/dbus.c                |  5 +++
+ ui/meson.build           |  3 ++
+ 5 files changed, 151 insertions(+), 1 deletion(-)
+ create mode 100644 ui/dbus-listener-metal.m
+ create mode 100644 ui/dbus-metal.h
+
+diff --git a/ui/dbus-listener-metal.m b/ui/dbus-listener-metal.m
+new file mode 100644
+index 00000000000..af0e1f98636
+--- /dev/null
++++ b/ui/dbus-listener-metal.m
+@@ -0,0 +1,84 @@
++/*
++ * D-Bus display: copy a Metal scanout texture into the listener's shared
++ * surface, so macOS clients receive accelerated frames over the documented
++ * org.qemu.Display1.Listener.Unix.Map interface.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "dbus-metal.h"
++#import <Metal/Metal.h>
++
++void *dbus_metal_texture_retain(void *texture)
++{
++    return [(id<MTLTexture>)texture retain];
++}
++
++void dbus_metal_texture_release(void *texture)
++{
++    [(id<MTLTexture>)texture release];
++}
++
++static bool is_rgba(MTLPixelFormat format)
++{
++    return format == MTLPixelFormatRGBA8Unorm ||
++           format == MTLPixelFormatRGBA8Unorm_sRGB;
++}
++
++void dbus_metal_texture_read(void *texture,
++                             uint32_t x, uint32_t y, uint32_t w, uint32_t h,
++                             uint8_t *dst, size_t dst_stride)
++{
++    id<MTLTexture> tex = texture;
++    MTLRegion region;
++
++    if (x >= tex.width || y >= tex.height) {
++        return;
++    }
++    w = MIN(w, tex.width - x);
++    h = MIN(h, tex.height - y);
++    region = MTLRegionMake2D(x, y, w, h);
++
++    @autoreleasepool {
++        if (tex.storageMode == MTLStorageModePrivate) {
++            static id<MTLCommandQueue> queue;
++            id<MTLBuffer> buf;
++            id<MTLCommandBuffer> cmd;
++            id<MTLBlitCommandEncoder> blit;
++
++            if (!queue) {
++                queue = [tex.device newCommandQueue];
++            }
++            buf = [tex.device newBufferWithLength:(NSUInteger)w * 4 * h
++                                          options:MTLResourceStorageModeShared];
++            cmd = [queue commandBuffer];
++            blit = [cmd blitCommandEncoder];
++            [blit copyFromTexture:tex sourceSlice:0 sourceLevel:0
++                     sourceOrigin:region.origin sourceSize:region.size
++                         toBuffer:buf destinationOffset:0
++                destinationBytesPerRow:w * 4 destinationBytesPerImage:w * 4 * h];
++            [blit endEncoding];
++            [cmd commit];
++            [cmd waitUntilCompleted];
++            for (uint32_t row = 0; row < h; row++) {
++                memcpy(dst + row * dst_stride, (uint8_t *)buf.contents + row * w * 4, w * 4);
++            }
++            [buf release];
++        } else {
++            [tex getBytes:dst bytesPerRow:dst_stride fromRegion:region mipmapLevel:0];
++        }
++    }
++
++    /* The shared surface is x8r8g8b8, i.e. BGRA in memory. */
++    if (is_rgba(tex.pixelFormat)) {
++        for (uint32_t row = 0; row < h; row++) {
++            uint8_t *p = dst + row * dst_stride;
++            for (uint32_t col = 0; col < w; col++, p += 4) {
++                uint8_t r = p[0];
++                p[0] = p[2];
++                p[2] = r;
++            }
++        }
++    }
++}
+diff --git a/ui/dbus-listener.c b/ui/dbus-listener.c
+index d524d5fc07f..98b8fbed7ee 100644
+--- a/ui/dbus-listener.c
++++ b/ui/dbus-listener.c
+@@ -26,6 +26,10 @@
+ #include "qapi/error.h"
+ #include "system/system.h"
+ #include "dbus.h"
++#if defined(CONFIG_OPENGL) && defined(CONFIG_METAL)
++#include "dbus-metal.h"
++#define DBUS_METAL_SCANOUT 1
++#endif
+ #include "glib.h"
+ #ifdef G_OS_UNIX
+ #include <gio/gunixfdlist.h>
+@@ -86,6 +90,11 @@ struct _DBusDisplayListener {
+ #else /* !WIN32 */
+     QemuDBusDisplay1ListenerUnixMap *map_proxy;
+     QemuDBusDisplay1ListenerUnixScanoutDMABUF2 *scanout_dmabuf_v2_proxy;
++#ifdef DBUS_METAL_SCANOUT
++    /* id<MTLTexture> of the current native scanout, retained */
++    void *metal_tex;
++    uint32_t metal_x, metal_y;
++#endif
+ #endif
+ 
+     guint dbus_filter;
+@@ -120,6 +129,9 @@ static void dbus_scanout_disable(DisplayChangeListener *dcl)
+     DBusDisplayListener *ddl = container_of(dcl, DBusDisplayListener, dcl);
+ 
+     ddl_discard_display_messages(ddl);
++#ifdef DBUS_METAL_SCANOUT
++    g_clear_pointer(&ddl->metal_tex, dbus_metal_texture_release);
++#endif
+ 
+     qemu_dbus_display1_listener_call_disable(
+         ddl->proxy, G_DBUS_CALL_FLAGS_NONE, -1, NULL, NULL, NULL);
+@@ -249,7 +261,7 @@ static void dbus_update_gl_cb(GObject *source_object,
+ static void dbus_call_update_gl(DisplayChangeListener *dcl,
+                                 int x, int y, int w, int h)
+ {
+-#if defined(CONFIG_GBM) || defined(WIN32)
++#if defined(CONFIG_GBM) || defined(WIN32) || defined(DBUS_METAL_SCANOUT)
+     DBusDisplayListener *ddl = container_of(dcl, DBusDisplayListener, dcl);
+ #endif
+ 
+@@ -294,6 +306,23 @@ static void dbus_call_update_gl(DisplayChangeListener *dcl,
+         g_warn_if_reached();
+     }
+ #endif
++
++#ifdef DBUS_METAL_SCANOUT
++    /*
++     * 2D content is already in the shared surface (the GL path only uploads
++     * it to a texture); a native scanout has to be copied back into it.
++     */
++    if (ddl->ds_share == SHARE_KIND_MAPPED) {
++        if (ddl->metal_tex) {
++            size_t stride = surface_stride(ddl->ds);
++            dbus_metal_texture_read(ddl->metal_tex,
++                                    ddl->metal_x + x, ddl->metal_y + y, w, h,
++                                    surface_data(ddl->ds) + y * stride + x * 4,
++                                    stride);
++        }
++        dbus_gfx_update(dcl, x, y, w, h);
++    }
++#endif
+ }
+ 
+ #ifdef CONFIG_GBM
+@@ -611,6 +640,21 @@ static void dbus_scanout_texture(DisplayChangeListener *dcl,
+     qemu_dmabuf_close(dmabuf);
+ #endif
+ 
++#ifdef DBUS_METAL_SCANOUT
++    DBusDisplayListener *ddl = container_of(dcl, DBusDisplayListener, dcl);
++
++    g_clear_pointer(&ddl->metal_tex, dbus_metal_texture_release);
++    if (!ddl->ds || !dbus_scanout_map(ddl)) {
++        warn_report_once("dbus: no shared surface for the GL scanout");
++        return;
++    }
++    if (native.type == SCANOUT_TEXTURE_NATIVE_TYPE_METAL) {
++        ddl->metal_tex = dbus_metal_texture_retain(native.handle);
++        ddl->metal_x = x;
++        ddl->metal_y = y;
++    }
++#endif
++
+ #ifdef WIN32
+     DBusDisplayListener *ddl = container_of(dcl, DBusDisplayListener, dcl);
+ 
+diff --git a/ui/dbus-metal.h b/ui/dbus-metal.h
+new file mode 100644
+index 00000000000..5e8813f7a98
+--- /dev/null
++++ b/ui/dbus-metal.h
+@@ -0,0 +1,14 @@
++/*
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef UI_DBUS_METAL_H
++#define UI_DBUS_METAL_H
++
++void *dbus_metal_texture_retain(void *texture);
++void dbus_metal_texture_release(void *texture);
++void dbus_metal_texture_read(void *texture,
++                             uint32_t x, uint32_t y, uint32_t w, uint32_t h,
++                             uint8_t *dst, size_t dst_stride);
++
++#endif
+diff --git a/ui/dbus.c b/ui/dbus.c
+index 7be0f8e2611..70cb9f4b86c 100644
+--- a/ui/dbus.c
++++ b/ui/dbus.c
+@@ -22,6 +22,7 @@
+  * THE SOFTWARE.
+  */
+ #include "qemu/osdep.h"
++#include "qemu-main.h"
+ #include "qemu/cutils.h"
+ #include "qemu/error-report.h"
+ #include "qemu/dbus.h"
+@@ -631,6 +632,10 @@ early_dbus_init(DisplayOptions *opts)
+     if (mode != DISPLAY_GL_MODE_OFF) {
+ #ifdef CONFIG_OPENGL
+         egl_init(opts->u.dbus.rendernode, mode, &error_fatal);
++#ifdef CONFIG_DARWIN
++        /* The EGL context is current on this thread: run the main loop here. */
++        qemu_main = NULL;
++#endif
+ #else
+         error_report("dbus: GL rendering is not supported");
+ #endif
+diff --git a/ui/meson.build b/ui/meson.build
+index d345f6c70d6..a250422638d 100644
+--- a/ui/meson.build
++++ b/ui/meson.build
+@@ -144,6 +144,9 @@ if dbus_display
+                 'dbus-listener.c',
+                 'dbus.c',
+               ), opengl, gbm, pixman, dbus_display1])
++  if metal.found()
++    dbus_ss.add(when: gio, if_true: [files('dbus-listener-metal.m'), metal])
++  endif
+   ui_modules += {'dbus' : dbus_ss}
+ endif
+ 

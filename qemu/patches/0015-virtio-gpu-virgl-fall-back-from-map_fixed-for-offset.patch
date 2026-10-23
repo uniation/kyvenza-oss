@@ -1,0 +1,34 @@
+From: Kyvenza <support@kyvenza.com>
+Date: Mon, 19 Oct 2026 15:05:54 +0800
+Subject: [PATCH] virtio-gpu-virgl: fall back from map_fixed for offsets not
+ aligned to the host page
+
+---
+ hw/display/virtio-gpu-virgl.c | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index 643756b1307..9b763ea83c8 100644
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -188,8 +188,18 @@ virtio_gpu_virgl_map_resource_blob(VirtIOGPU *g,
+         return -EBUSY;
+     }
+ 
+-    ret = virgl_renderer_resource_map_fixed(res->base.resource_id,
+-                                            gl->hostmem_mmap + offset);
++    /*
++     * MAP_FIXED needs a host-page-aligned address. With a 4 KiB guest IPA
++     * granule on a 16 KiB-page host (hvf ipa-granule-size=0x1000 on Apple
++     * silicon) the guest may place a blob at any 4 KiB offset; use the
++     * subregion method for those.
++     */
++    if (!QEMU_IS_ALIGNED(offset, qemu_real_host_page_size())) {
++        ret = -EOPNOTSUPP;
++    } else {
++        ret = virgl_renderer_resource_map_fixed(res->base.resource_id,
++                                                gl->hostmem_mmap + offset);
++    }
+     switch (ret) {
+     case 0:
+         res->map_fixed = gl->hostmem_mmap + offset;

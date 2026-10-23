@@ -1,0 +1,112 @@
+From: Joelle van Dyne <j@getutm.app>
+Date: Sun, 30 Nov 2025 00:11:27 -0800
+Subject: [PATCH] virtio-gpu-virgl: support scanout of Metal textures
+
+When supported, virglrenderer will return a MTLTexture handle that can be
+directly used for scanout.
+
+Signed-off-by: Joelle van Dyne <j@getutm.app>
+
+(cherry picked from utmapp/qemu commit 123780d896; ui/console API renamed for 11.1)
+---
+ hw/display/virtio-gpu-virgl.c | 12 +++++++++++-
+ hw/display/virtio-gpu.c       | 10 ++++++++--
+ include/ui/console.h          |  1 +
+ meson.build                   |  3 +++
+ 4 files changed, 23 insertions(+), 3 deletions(-)
+
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index 5d5a99827f3..58e50a8cb35 100644
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -580,6 +580,13 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
+ #if VIRGL_RENDERER_RESOURCE_INFO_EXT_VERSION >= NATIVE_HANDLE_SUPPORT_VERSION
+         if (ext.version >= VIRGL_RENDERER_RESOURCE_INFO_EXT_VERSION) {
+             switch (ext.native_type) {
++#ifdef CONFIG_METAL
++            case VIRGL_NATIVE_HANDLE_METAL_TEXTURE: {
++                native.type = SCANOUT_TEXTURE_NATIVE_TYPE_METAL;
++                native.handle = ext.native_handle;
++                break;
++            }
++#endif
+             case VIRGL_NATIVE_HANDLE_NONE:
+             case VIRGL_NATIVE_HANDLE_D3D_TEX2D: {
+                 /* already handled above */
+@@ -1483,7 +1490,10 @@ static int virtio_gpu_virgl_init(VirtIOGPU *g)
+     }
+ #if VIRGL_VERSION_MAJOR >= 1
+     if (virtio_gpu_venus_enabled(g->parent_obj.conf)) {
+-        flags |= VIRGL_RENDERER_VENUS | VIRGL_RENDERER_RENDER_SERVER;
++        flags |= VIRGL_RENDERER_VENUS;
++#ifndef CONFIG_METAL /* Metal does not support render server */
++        flags |= VIRGL_RENDERER_RENDER_SERVER;
++#endif
+     }
+     if (virtio_gpu_drm_enabled(g->parent_obj.conf)) {
+         flags |= VIRGL_RENDERER_DRM;
+diff --git a/hw/display/virtio-gpu.c b/hw/display/virtio-gpu.c
+index fbb6fec7a0a..7d4dbff3480 100644
+--- a/hw/display/virtio-gpu.c
++++ b/hw/display/virtio-gpu.c
+@@ -1598,12 +1598,18 @@ void virtio_gpu_device_realize(DeviceState *qdev, Error **errp)
+ {
+     VirtIODevice *vdev = VIRTIO_DEVICE(qdev);
+     VirtIOGPU *g = VIRTIO_GPU(qdev);
++    bool have_ext_memory;
+ 
+     if (virtio_gpu_blob_enabled(g->parent_obj.conf)) {
++#ifdef CONFIG_METAL
++        have_ext_memory = virtio_gpu_venus_enabled(g->parent_obj.conf);
++#else
++        have_ext_memory = virtio_gpu_have_udmabuf();
++#endif
+         if (!virtio_gpu_rutabaga_enabled(g->parent_obj.conf) &&
+             !virtio_gpu_virgl_enabled(g->parent_obj.conf) &&
+-            !virtio_gpu_have_udmabuf()) {
+-            error_setg(errp, "need rutabaga or udmabuf for blob resources");
++            !have_ext_memory) {
++            error_setg(errp, "need rutabaga or ext memory for blob resources");
+             return;
+         }
+ 
+diff --git a/include/ui/console.h b/include/ui/console.h
+index a1f42b5a458..ed73df272fa 100644
+--- a/include/ui/console.h
++++ b/include/ui/console.h
+@@ -96,6 +96,7 @@ struct QemuConsoleClass {
+ typedef enum ScanoutTextureNativeType {
+     SCANOUT_TEXTURE_NATIVE_TYPE_NONE,
+     SCANOUT_TEXTURE_NATIVE_TYPE_D3D,
++    SCANOUT_TEXTURE_NATIVE_TYPE_METAL,
+ } ScanoutTextureNativeType;
+ 
+ typedef struct ScanoutTextureNative {
+diff --git a/meson.build b/meson.build
+index 49a5baf5b52..edb821ec439 100644
+--- a/meson.build
++++ b/meson.build
+@@ -824,6 +824,7 @@ version_res = []
+ coref = []
+ iokit = []
+ pvg = not_found
++metal = not_found
+ emulator_link_args = []
+ midl = not_found
+ widl = not_found
+@@ -851,6 +852,7 @@ elif host_os == 'darwin'
+   host_dsosuf = '.dylib'
+   pvg = dependency('appleframeworks', modules: ['ParavirtualizedGraphics', 'Metal'],
+                    required: get_option('pvg'))
++  metal = dependency('appleframeworks', modules: 'Metal', required: false)
+ elif host_os == 'sunos'
+   socket = [cc.find_library('socket'),
+             cc.find_library('nsl'),
+@@ -2560,6 +2562,7 @@ if xen.found()
+     ('0' + xen_version[2]).substring(-2)
+   config_host_data.set('CONFIG_XEN_CTRL_INTERFACE_VERSION', xen_ctrl_version)
+ endif
++config_host_data.set('CONFIG_METAL', metal.found())
+ config_host_data.set('QEMU_VERSION', '"@0@"'.format(meson.project_version()))
+ config_host_data.set('QEMU_VERSION_MAJOR', meson.project_version().split('.')[0])
+ config_host_data.set('QEMU_VERSION_MINOR', meson.project_version().split('.')[1])

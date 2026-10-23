@@ -1,0 +1,40 @@
+From: Kyvenza <support@kyvenza.com>
+Date: Mon, 19 Oct 2026 16:03:55 +0800
+Subject: [PATCH] virtio-gpu-virgl: do not use map_fixed on macOS
+
+Hypervisor.framework appears to keep mapping the pages that backed the
+hostmem region when it was registered: replacing them in place with MAP_FIXED
+is not seen by the guest and blob contents stay stale. On Windows/Triton the
+second WebGL page in a boot renders nothing. Always use the subregion
+method there.
+---
+ hw/display/virtio-gpu-virgl.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index 9b763ea83c8..17f8070c8c4 100644
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -193,13 +193,22 @@ virtio_gpu_virgl_map_resource_blob(VirtIOGPU *g,
+      * granule on a 16 KiB-page host (hvf ipa-granule-size=0x1000 on Apple
+      * silicon) the guest may place a blob at any 4 KiB offset; use the
+      * subregion method for those.
++     *
++     * On macOS, Hypervisor.framework keeps mapping the pages that backed
++     * hostmem when it was registered; replacing them in place with MAP_FIXED
++     * is not seen by the guest (the blob reads stay stale), so never use
++     * MAP_FIXED there.
+      */
++#ifdef CONFIG_DARWIN
++    ret = -EOPNOTSUPP;
++#else
+     if (!QEMU_IS_ALIGNED(offset, qemu_real_host_page_size())) {
+         ret = -EOPNOTSUPP;
+     } else {
+         ret = virgl_renderer_resource_map_fixed(res->base.resource_id,
+                                                 gl->hostmem_mmap + offset);
+     }
++#endif
+     switch (ret) {
+     case 0:
+         res->map_fixed = gl->hostmem_mmap + offset;

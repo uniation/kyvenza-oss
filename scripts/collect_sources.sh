@@ -13,11 +13,14 @@
 # **哪些是义务、哪些是好意,分清楚**:
 #   义务  QEMU(GPLv2)、SPICE vd_agent(GPLv2+,随驱动光盘进客体)、
 #         glib 系(LGPL-2.1+:glib/gobject/gio/gmodule)、
-#         json-glib(LGPL-2.1+)、gettext 的 libintl(LGPL-2.1+)
+#         json-glib(LGPL-2.1+)、gettext 的 libintl(LGPL-2.1+)、
+#         DXMT(LGPL-2.1,图形加速的 D3D11→Metal 层,build_gfx.sh 构建)
 #   好意  pixman(MIT)、libslirp / PCRE2 / libtpms / swtpm(BSD)、OpenSSL(Apache-2.0)
 #         —— 许可不要求交付源码。但随包的这些全是 build_deps26.sh 从固定 tarball 编的,
 #         交付包里已经有那个脚本,不给它的输入就复现不出我们发的字节,所以一并放进 permissive/。
-#   不收  edk2(BSD-2-Clause-Patent,构建脚本已附)、virtio-win 驱动(BSD-3,上游二进制)
+#   不收  edk2(BSD-2-Clause-Patent,构建脚本已附)、virtio-win 驱动(BSD-3,上游二进制)、
+#         ANGLE(BSD-3)、libepoxy / virglrenderer(MIT)、directx-native(Apache-2.0)、
+#         LLVM(Apache-2.0 WITH LLVM-exception)—— 声明里给出上游地址,build_gfx.sh 已附。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -99,7 +102,7 @@ fetch() {
 }
 
 rm -rf "$OUT"
-mkdir -p "${OUT}/qemu" "${OUT}/scripts" "${OUT}/lgpl" "${OUT}/permissive" "${OUT}/vdagent"
+mkdir -p "${OUT}/qemu" "${OUT}/scripts" "${OUT}/lgpl" "${OUT}/permissive" "${OUT}/vdagent" "${OUT}/gfx"
 
 # ── QEMU:我们分发的那份二进制的完整对应源码 ──────────────────────
 echo "==> QEMU ${QEMU_VERSION}"
@@ -161,7 +164,7 @@ echo "    补丁 ${#VDAGENT_PATCHES[@]} 个"
 
 # ── 构建方式(GPLv2 §3 明文要求)────────────────────────────────
 echo "==> 构建脚本"
-for s in build_qemu.sh build_deps26.sh build_firmware.sh stage_helpers.sh sign_helpers.sh; do
+for s in build_qemu.sh build_deps26.sh build_gfx.sh build_firmware.sh stage_helpers.sh sign_helpers.sh; do
     cp "${DIR}/${s}" "${OUT}/scripts/"
     echo "    ${s}"
 done
@@ -201,6 +204,32 @@ echo "$DEPS26_SOURCES" | while IFS='|' read -r name version url sha license file
         fetch "$url" "${OUT}/${sub}/${file}" "$sha"
     fi
 done
+
+# ── 图形加速:DXMT(LGPL-2.1)与我们给各组件打的补丁 ───────────────
+# DXMT 没有发布 tarball,我们钉的是 utmapp/dxmt 的一个提交(含两个子模块),所以
+# "对应源码"= 那个提交的完整检出 + gfx-patches/dxmt + build_gfx.sh。检出由
+# build_gfx.sh 留在 gfx-src/ 里;核对它确实是脚本钉的那个提交,再打包。
+# 其余组件(ANGLE、libepoxy、virglrenderer、LLVM)是宽松许可,只交付补丁,
+# 好让人照着 build_gfx.sh 能复现我们发的那份二进制。
+echo "==> 图形加速"
+GFX_SCRIPT="${DIR}/build_gfx.sh"
+DXMT_COMMIT="$(read_default "$GFX_SCRIPT" DXMT_COMMIT)"
+DXMT_SRC="${ROOT}/.local/qemu/gfx-src/dxmt"
+bash "$GFX_SCRIPT" --check >/dev/null 2>&1 || die "图形加速依赖与 build_gfx.sh 不对应:先跑 make gfx 并重新组包"
+[ "$(git -C "$DXMT_SRC" rev-parse HEAD 2>/dev/null)" = "$DXMT_COMMIT" ] || \
+    die "${DXMT_SRC} 不是 build_gfx.sh 钉的 ${DXMT_COMMIT}"
+echo "  dxmt ${DXMT_COMMIT:0:12}"
+# 排序、固定属主与修改时间:同一个提交打出来的 tarball 字节相同,不随检出时间变。
+DXMT_STAGE="$(mktemp -d)"
+rsync -a --exclude .git "${DXMT_SRC}/" "${DXMT_STAGE}/dxmt-${DXMT_COMMIT}/"
+find "$DXMT_STAGE" -exec touch -h -t 202601010000 {} +
+(cd "$DXMT_STAGE" && find "dxmt-${DXMT_COMMIT}" | LC_ALL=C sort \
+    | tar -c -n --uid 0 --gid 0 --uname root --gname root -T - -f - ) \
+    | xz -9 > "${OUT}/gfx/dxmt-${DXMT_COMMIT}.tar.xz"
+rm -rf "$DXMT_STAGE"
+git -C "$DXMT_SRC" submodule status --recursive > "${OUT}/gfx/dxmt-${DXMT_COMMIT}.submodules.txt"
+cp -R "${DIR}/gfx-patches" "${OUT}/gfx/patches"
+echo "    补丁 $(find "${OUT}/gfx/patches" -name '*.patch' | wc -l | tr -d ' ') 个"
 
 cp "${ROOT}/docs/oss-sources-README.md" "${OUT}/README.md"
 

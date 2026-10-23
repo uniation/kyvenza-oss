@@ -1,0 +1,48 @@
+From: osy <osy@turing.llc>
+Date: Sun, 5 Jul 2026 18:40:28 -0700
+Subject: [PATCH] virtio-gpu: enable render server for Venus/Neptune on macOS
+
+virtio_gpu_virgl_init() gated VIRGL_RENDERER_RENDER_SERVER behind
+#ifndef CONFIG_METAL, so on macOS (CONFIG_METAL defined) the flag was
+never set. This virglrenderer build serves Venus/Neptune exclusively
+out-of-process via the render-server proxy, so without the flag
+proxy_renderer_init() never runs, state.proxy_initialized stays false,
+and virgl_renderer_fill_caps(VENUS) leaves the capset zeroed. The guest
+Mesa Venus driver then reports "Unsupported wire format version 0" and
+vkEnumeratePhysicalDevices fails, leaving llvmpipe as the only device.
+
+Set VIRGL_RENDERER_RENDER_SERVER unconditionally for venus/neptune.
+With this, the render servers spawn at init and the guest enumerates the
+Venus physical device (Virtio-GPU Venus, DRIVER_ID_MESA_VENUS).
+
+Assisted-by: Claude:claude-opus-4-8
+
+(cherry picked from utmapp/qemu commit 268dee8834; ui/console API renamed for 11.1)
+---
+ hw/display/virtio-gpu-virgl.c | 4 ----
+ 1 file changed, 4 deletions(-)
+
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index ecc0e7483e0..80998969014 100644
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -1551,9 +1551,7 @@ static int virtio_gpu_virgl_init(VirtIOGPU *g)
+ #if VIRGL_VERSION_MAJOR >= 1
+     if (virtio_gpu_venus_enabled(g->parent_obj.conf)) {
+         flags |= VIRGL_RENDERER_VENUS;
+-#ifndef CONFIG_METAL /* Metal does not support render server */
+         flags |= VIRGL_RENDERER_RENDER_SERVER;
+-#endif
+     }
+     if (virtio_gpu_drm_enabled(g->parent_obj.conf)) {
+         flags |= VIRGL_RENDERER_DRM;
+@@ -1578,9 +1576,7 @@ static int virtio_gpu_virgl_init(VirtIOGPU *g)
+ #ifdef VIRGL_RENDERER_NEPTUNE
+     if (virtio_gpu_neptune_enabled(g->parent_obj.conf)) {
+         flags |= VIRGL_RENDERER_NEPTUNE;
+-#ifndef CONFIG_METAL
+         flags |= VIRGL_RENDERER_RENDER_SERVER;
+-#endif
+     }
+ #endif
+ 
