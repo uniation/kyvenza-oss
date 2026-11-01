@@ -80,4 +80,11 @@ for exe in qemu-img swtpm virgl_render_server; do
         --sign "$IDENTITY" "${HELPERS}/${exe}"
 done
 
+# 3) 命令行工具 kyvenza(只有直接下载版带)。用户在终端里直接跑它，不是 App 拉起的子进程:
+#    不能带 com.apple.security.inherit(独立启动的继承沙盒进程会被直接杀掉),也不需要任何
+#    entitlement —— 它只往 127.0.0.1 发 HTTP。
+if [ -e "${HELPERS}/kyvenza" ]; then
+    codesign --force --timestamp $RUNTIME_FLAG --sign "$IDENTITY" "${HELPERS}/kyvenza"
+fi
+
 echo "sign_helpers: 完成"
