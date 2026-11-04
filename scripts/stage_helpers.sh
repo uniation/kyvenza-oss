@@ -374,8 +374,18 @@ import io, os, sys
 script = r"""@echo off
 title Kyvenza Guest Tools
 
+rem /quiet: unattended use (Windows setup's first logon runs us with stdin
+rem redirected). No UAC prompt, no "press any key" at the end. Nobody is there
+rem to click either, and a pause would hold the first logon forever.
+set KYVQUIET=
+if /i "%~1"=="/quiet" set KYVQUIET=1
+
 net session >nul 2>&1
 if not errorlevel 1 goto install
+if defined KYVQUIET (
+    echo    Install-Kyvenza-Drivers /quiet must run as administrator.
+    exit /b 2
+)
 powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
 exit /b
 
@@ -447,7 +457,7 @@ sc stop vdservice >nul 2>&1
 sc delete vdservice >nul 2>&1
 rem sc returns as soon as the stop is pending, and vdagent.exe runs in the user
 rem session rather than as the service itself, so neither file is free yet.
-timeout /t 3 /nobreak >nul
+ping -n 4 127.0.0.1 >nul
 taskkill /f /im vdagent.exe >nul 2>&1
 copy /Y "%~dp0vdagent.exe" "%KYVDIR%\" >nul
 if errorlevel 1 goto agentbusy
@@ -457,7 +467,7 @@ if errorlevel 1 goto agentbusy
 sc start vdservice >nul 2>&1
 rem sc start returns as soon as the service is START_PENDING, so give it a
 rem moment before asking whether it is actually running.
-timeout /t 3 /nobreak >nul
+ping -n 4 127.0.0.1 >nul
 sc query vdservice | find "RUNNING" >nul
 if errorlevel 1 (
     echo    The clipboard agent did not start. Everything else is installed;
@@ -606,14 +616,14 @@ rem here rather than leaving them to find it.
 echo    If Kyvenza's display window was open while this ran, close it and
 echo    open it again. The clipboard reconnects with the window.
 echo.
-pause
+if not defined KYVQUIET pause
 exit /b 0
 
 :failed
 echo.
 echo    Something went wrong. Please report this to support@kyvenza.com.
 echo.
-pause
+if not defined KYVQUIET pause
 exit /b 1
 """
 # 登录时跑的小脚本。**它不能内嵌 URL** —— 端口与 token 是每台 VM 一份、
