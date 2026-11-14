@@ -429,9 +429,22 @@ rem It also runs at every startup, so switching acceleration on or off in
 rem Kyvenza takes effect on the next boot without running this installer again.
 rem Both drivers are kept on the system drive for that, since the startup task
 rem cannot count on this disc being in the drive.
+rem
+rem The resolution service (vgpusrv, which starts viogpuap in the signed-in
+rem session) is what makes Windows follow the size of Kyvenza's display window.
+rem It runs from one of the two folders below, so stop it first: a running copy
+rem keeps its executable locked and the folder could not be replaced.
+sc stop vgpusrv >nul 2>&1
+taskkill /f /im viogpuap.exe >nul 2>&1
+ping -n 3 127.0.0.1 >nul
 if exist "%KYVDIR%\viogpudo" rmdir /s /q "%KYVDIR%\viogpudo"
 mkdir "%KYVDIR%\viogpudo"
 copy /Y "%~dp0viogpudo.*" "%KYVDIR%\viogpudo\" >nul
+rem viogpudo's driver package does not install its resolution service (the
+rem viogpu3d one does), so keep the matching pair next to the driver. The
+rem startup script below registers whichever pair matches the driver in use.
+copy /Y "%~dp0vgpusrv.exe" "%KYVDIR%\viogpudo\" >nul
+copy /Y "%~dp0viogpuap.exe" "%KYVDIR%\viogpudo\" >nul
 rem viogpu3d stays zipped on this disc so that nothing that scans the disc for
 rem drivers (Windows Setup's "Install driver" button, the pnputil step above)
 rem can install it by accident. tar ships with Windows and reads zip files.
@@ -555,8 +568,16 @@ netsh advfirewall firewall add rule name="Kyvenza SSH (host only)" dir=in action
 rem The per-VM public key is NOT on this disc: this disc ships with Kyvenza and
 rem is the same for every VM, while each VM has its own key. The key arrives on
 rem the small KYVENZA script disc instead, which Kyvenza rewrites at every boot.
-copy /Y "%~dp0Find-Kyvenza-SSH.cmd" "%KYVDIR%\" >nul 2>&1
-call "%KYVDIR%\Find-Kyvenza-SSH.cmd" /quiet >nul 2>&1
+rem
+rem A startup task installs it from there at every boot, not just now. A clone
+rem of this VM gets a new key on the Mac, while the Windows inside it still
+rem lists this VM's key; the task swaps it, so a clone (or an AI assistant's
+rem sandbox) can run commands right away and the two VMs never accept each
+rem other's key. Keys you added to the file yourself are kept.
+copy /Y "%~dp0Update-Kyvenza-SSHKey.ps1" "%KYVDIR%\" >nul
+schtasks /create /tn "Kyvenza SSH Key" /sc onstart /ru SYSTEM /rl highest /f /tr "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%KYVDIR%\Update-Kyvenza-SSHKey.ps1\" -Quiet" >nul 2>&1
+if errorlevel 1 echo    Could not register the startup task for the SSH key.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%KYVDIR%\Update-Kyvenza-SSHKey.ps1" -Quiet -WaitSeconds 0 >nul 2>&1
 rem Report the outcome rather than assuming it. A wrong ACL on the key file makes
 rem sshd ignore it *silently* - the only trace is in the Event Viewer - so the
 rem failure has to be visible here, while the user is still looking.
@@ -565,8 +586,10 @@ if errorlevel 1 (
     echo    OpenSSH Server is installed but not running. Check the Event Viewer.
 ) else (
     if not exist "%ProgramData%\ssh\administrators_authorized_keys" (
-        echo    OpenSSH Server is running, but this VM's key was not found.
-        echo    Open the KYVENZA disc and run Configure-Kyvenza-SSH as administrator.
+        echo    OpenSSH Server is running. This VM's key is not on this machine yet;
+        echo    it is installed automatically the next time Windows starts. If
+        echo    commands still fail after a restart, open the KYVENZA disc and run
+        echo    Configure-Kyvenza-SSH as administrator.
     ) else (
         netsh advfirewall firewall show rule name="Kyvenza SSH (host only)" >nul 2>&1
         if errorlevel 1 (
@@ -642,18 +665,111 @@ for %%d in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do (
 exit /b 1
 """
 
-# SSH 侧同构:这张光盘上只有「去找那张盘」的逻辑,每台 VM 独有的公钥在那张盘上。
-ssh_finder = r"""@echo off
-rem Find the Kyvenza script disc and run the SSH setup on it. That disc carries
-rem this VM's own public key, which this file deliberately does not: this disc
-rem ships with the app and is identical for every VM.
-for %%d in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do (
-    if exist %%d:\Configure-Kyvenza-SSH.cmd (
-        call %%d:\Configure-Kyvenza-SSH.cmd %*
-        exit /b 0
-    )
-)
-exit /b 1
+# SSH 侧同构:这张光盘上只有「去找那张盘、装上那把钥匙」的逻辑,每台 VM 独有的公钥在
+# KYVENZA 脚本盘上(`WindowsSSHGuestScript.publicKeyName`,宿主每次开机重写)。
+# 安装器调一次,之后每次开机由 SYSTEM 的计划任务调 —— 克隆体第一次开机就换成自己的钥匙。
+#
+# 安全上的几条,改的时候别丢:
+# - 只认卷标 KYVENZA 的本地盘(DriveType 2/3)。SYSTEM 在开机时看不到任何用户映射的网络盘
+#   (包括我们自己的 Z: 共享盘),非管理员也挂不上新卷,所以普通用户塞不进一把自己的钥匙。
+# - 文件必须恰好一行且符合 `WindowsSSHGuestScript.managedKeyPattern`,否则什么都不动。
+# - **替换,不是追加**:注释是 kyvenza-XXXXXXXX 的行全部删掉再写入这一行,母机的钥匙因此
+#   进不了克隆体;其它行(用户自己加的钥匙)保留。
+# - ACL 按 SID 收紧到只剩 Administrators 与 SYSTEM:多一个可写主体 sshd 就静默忽略整个文件;
+#   组名是本地化的,按名字授权在德文/法文客体上会解析失败。
+# - 盘上没有钥匙(宿主关了 SSH、或端口全被占的那次启动)时什么都不动,不清空。
+ssh_key = r"""# Kyvenza: keep this VM's own key in administrators_authorized_keys.
+#
+# Kyvenza writes the VM's public key to kyvenza-ssh.pub on the KYVENZA disc at
+# every boot. A cloned VM gets a new key on the Mac, but the Windows inside the
+# clone still lists the key of the VM it was copied from, so the Mac could not
+# sign in. This script runs at every startup and swaps the key.
+#
+# Only the line Kyvenza manages is replaced (a key whose comment is
+# kyvenza-XXXXXXXX). Keys you added to the file yourself are kept. The key of
+# the VM this one was cloned from is a Kyvenza key too, so it is removed: a
+# clone and the VM it came from never accept each other's key.
+#
+# The key is read only from the KYVENZA disc and must be a single well-formed
+# ed25519 key. With no key on the disc nothing changes.
+param([switch]$Quiet, [int]$WaitSeconds = 60)
+
+$dir = Join-Path $env:ProgramFiles 'Kyvenza'
+$log = Join-Path $dir 'ssh-key.log'
+function Say([string]$message) {
+    Add-Content -LiteralPath $log -Value ((Get-Date -Format s) + ' ' + $message) -ErrorAction SilentlyContinue
+    if (-not $Quiet) { Write-Host ('   ' + $message) }
+}
+
+$keyFile = Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'
+$keyPattern = '^ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI[A-Za-z0-9+/]{43} kyvenza-[0-9A-Fa-f]{8}$'
+$managedPattern = ' kyvenza-[0-9A-Fa-f]{8}\s*$'
+
+if (-not (Get-Service -Name sshd -ErrorAction SilentlyContinue)) {
+    Say 'OpenSSH Server is not installed; SSH key left as is.'
+    exit 0
+}
+
+# The disc may appear a little after this task starts at boot.
+$disc = $null
+$deadline = (Get-Date).AddSeconds($WaitSeconds)
+while ($true) {
+    $disc = Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType=2 OR DriveType=3' -ErrorAction SilentlyContinue |
+        Where-Object { ([string]$_.VolumeName).Trim() -eq 'KYVENZA' } | Select-Object -First 1
+    if ($disc -or (Get-Date) -ge $deadline) { break }
+    Start-Sleep -Seconds 2
+}
+if (-not $disc) {
+    Say 'KYVENZA disc not found; SSH key left as is.'
+    exit 0
+}
+$source = Join-Path ($disc.DeviceID + '\') 'kyvenza-ssh.pub'
+if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+    Say 'No SSH key on the KYVENZA disc (SSH access is off for this VM); SSH key left as is.'
+    exit 0
+}
+if ((Get-Item -LiteralPath $source).Length -gt 1024) {
+    Say 'The key file on the KYVENZA disc is too large; SSH key left as is.'
+    exit 1
+}
+$lines = @(Get-Content -LiteralPath $source | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+if ($lines.Count -ne 1 -or $lines[0] -cnotmatch $keyPattern) {
+    Say 'The key file on the KYVENZA disc is not a Kyvenza key; SSH key left as is.'
+    exit 1
+}
+$key = $lines[0]
+
+$existing = @()
+if (Test-Path -LiteralPath $keyFile) { $existing = @(Get-Content -LiteralPath $keyFile) }
+$kept = @($existing | Where-Object { $_.Trim() -and ($_ -notmatch $managedPattern) })
+$wanted = @($kept) + $key
+if (($existing -join "`n") -cne ($wanted -join "`n")) {
+    $sshDir = Split-Path -Parent $keyFile
+    if (-not (Test-Path -LiteralPath $sshDir)) { New-Item -ItemType Directory -Path $sshDir | Out-Null }
+    try {
+        [IO.File]::WriteAllText($keyFile, (($wanted -join "`r`n") + "`r`n"), (New-Object Text.UTF8Encoding($false)))
+    } catch {
+        Say ('Could not write ' + $keyFile + ': ' + $_.Exception.Message)
+        exit 1
+    }
+    $removed = @($existing | Where-Object { $_ -match $managedPattern }).Count
+    Say ('Installed this VM''s SSH key (' + $key.Split(' ')[2] + '), replaced ' + $removed + ' earlier Kyvenza key(s).')
+} else {
+    Say ('SSH key already current (' + $key.Split(' ')[2] + ').')
+}
+
+# Only Administrators and SYSTEM, by SID: sshd silently ignores the whole file
+# when anyone else can write it, and group names are localized.
+& icacls.exe $keyFile /reset | Out-Null
+& icacls.exe $keyFile /inheritance:r /grant:r '*S-1-5-32-544:F' '*S-1-5-18:F' | Out-Null
+$allowed = @('S-1-5-32-544', 'S-1-5-18')
+$rules = (Get-Acl -LiteralPath $keyFile).GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])
+$others = @($rules | Where-Object { $allowed -notcontains $_.IdentityReference.Value })
+if ($others.Count -gt 0) {
+    Say 'The key file is still accessible to other accounts; sshd will ignore it.'
+    exit 1
+}
+exit 0
 """
 
 # 显示驱动二选一。由安装器调一次,之后每次开机由 SYSTEM 的计划任务调。
@@ -732,6 +848,38 @@ foreach ($package in Find-Package $other) {
 }
 if ($changed) { & pnputil.exe /scan-devices | Out-Null }
 
+# Resolution service. When Kyvenza's display window is resized, the display
+# driver signals an event and vgpusrv's helper (viogpuap, which it starts in the
+# signed-in session) switches Windows to the new size. viogpu3d's package
+# registers the service itself, but from the driver store, which is gone once
+# this script removes viogpu3d; viogpudo's package does not register it at all.
+# So point the service at the copy that matches the driver in use, kept under
+# Program Files. Not fatal: without it the display simply keeps its size.
+$service = $null
+if ($want -eq 'viogpudo') {
+    $service = Join-Path $dir 'viogpudo\vgpusrv.exe'
+} else {
+    $found = Get-ChildItem -LiteralPath (Join-Path $dir 'viogpu3d') -Recurse -Filter 'vgpusrv.exe' -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($found) { $service = $found.FullName }
+}
+if ($service -and (Test-Path -LiteralPath $service)) {
+    # Quoted: the path has a space in it, and an unquoted service path with
+    # spaces is both fragile and a known privilege-escalation pattern.
+    $path = '"' + $service + '"'
+    $existing = Get-CimInstance Win32_Service -Filter "Name='vgpusrv'" -ErrorAction SilentlyContinue
+    if (-not $existing) {
+        New-Service -Name 'vgpusrv' -BinaryPathName $path -DisplayName 'VioGpu Resolution Service' -StartupType Automatic -ErrorAction SilentlyContinue | Out-Null
+    } elseif ($existing.PathName -ne $path -or $existing.StartMode -ne 'Auto') {
+        Stop-Service -Name 'vgpusrv' -Force -ErrorAction SilentlyContinue
+        $null = Invoke-CimMethod -InputObject $existing -MethodName Change -Arguments @{ PathName = $path; StartMode = 'Automatic' }
+    }
+    Start-Service -Name 'vgpusrv' -ErrorAction SilentlyContinue
+    Say ('Resolution service: ' + (Get-Service -Name 'vgpusrv' -ErrorAction SilentlyContinue).Status + '.')
+} else {
+    Say ('Resolution service for ' + $want + ' not found under ' + $dir + '. Run Install-Kyvenza-Drivers again.')
+}
+
 $adapter = Get-PnpDevice -Class Display -PresentOnly -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($adapter) {
     Say ('Graphics ' + $mode + ': ' + $adapter.FriendlyName + ', ' + $adapter.Status + '.')
@@ -743,7 +891,7 @@ exit 0
 
 for name, text in (("Install-Kyvenza-Drivers.cmd", script),
                    ("Find-Kyvenza-Shares.cmd", finder),
-                   ("Find-Kyvenza-SSH.cmd", ssh_finder),
+                   ("Update-Kyvenza-SSHKey.ps1", ssh_key),
                    ("Set-Kyvenza-Display.ps1", display)):
     out = os.path.join(sys.argv[1], name)
     io.open(out, "wb").write(text.replace("\n", "\r\n").encode("ascii"))

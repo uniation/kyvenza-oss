@@ -99,7 +99,11 @@ command -v pkg-config >/dev/null || die "缺 pkg-config(brew install pkgconf)"
 command -v xcodebuild >/dev/null || die "缺 Xcode:ANGLE 用 xcodebuild 构建"
 # ANGLE 构建时要把内置的 Metal 着色器预编译成 metallib。Xcode 26 起 Metal 编译器是
 # 单独下载的组件,没装时 xcodebuild 会在构建中途才失败。运行时不需要它。
-xcrun -f metal >/dev/null 2>&1 || die "缺 Metal Toolchain:xcodebuild -downloadComponent MetalToolchain"
+# 要真的执行一次:`xcrun -f metal` 只找文件，而 Xcode 里始终有个 metal 的空壳，工具链没装也能找到。
+# 组件按 Xcode 版本装，升级 Xcode 后要重新下载(2026-11-10 升到 27.2 后这里漏判，构建跑到 ANGLE
+# 才失败，而那时下面已经清空了 .local/qemu/gfx)。
+xcrun -sdk macosx metal --version >/dev/null 2>&1 \
+    || die "缺 Metal Toolchain(升级 Xcode 后要重新下载):xcodebuild -downloadComponent MetalToolchain"
 
 SDKROOT=""
 for candidate in \
